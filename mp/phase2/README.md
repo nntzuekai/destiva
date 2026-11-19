@@ -51,6 +51,8 @@ unsound), `timeout`, `unsupported`, `translation_error`, `crash`, and
 
 ## Server setup
 
+### Docker
+
 The Dockerfile copies `mp/` into the image and compiles the indexed-pair
 validator change. Rebuild the image from the `mp` branch:
 
@@ -66,8 +68,35 @@ cd /root/destiva
 ```
 
 The bind mount preserves manifests and results after the container exits.
-The scripts also work in a native Ubuntu 24.04 build with the same LLVM,
-Alive2, and Z3 versions.
+
+### Native Ubuntu 24.04
+
+Use an Ubuntu 24.04 checkout of the `mp` branch:
+
+```sh
+git switch mp
+git pull
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build git python3 re2c zlib1g-dev util-linux
+```
+
+Build LLVM, Z3, and Alive2 using the native setup in the repository's main
+README. If the project is already built, rebuild Alive2 so the Phase 2 indexed
+segment selector added to `tv.cpp` is included:
+
+```sh
+cmake --build alive2-decomp/build -j 16
+alive2-decomp/build/opt-alive-test.sh --help | \
+  grep tv-check-index-pairs
+mkdir -p mp/phase2/work mp/phase2/results
+```
+
+`util-linux` supplies `prlimit`, which the experiment driver uses to impose a
+per-process memory limit. By default the scripts look for LLVM at
+`llvm-project/build/bin/opt` and Alive2 at
+`alive2-decomp/build/opt-alive-test.sh`; override those paths with `--opt` and
+`--opt-alive` if your native builds are elsewhere.
 
 ## 1. Create a pilot manifest
 
@@ -195,8 +224,10 @@ entire corpus:
 4. All functions only after estimating completion time and timeout rate.
 
 Keep concurrency fixed across comparable runs. Record server load, CPU model,
-memory, Git commit, and container image identifier. The runner embeds the Git
-commit, hostname, timeout, memory limit, and concurrency in each result.
+memory, LLVM/Z3 versions, Git commit, and build type. Also record the container
+image identifier for Docker runs, or the operating-system and kernel versions
+for native runs. The runner embeds the Git commit, hostname, timeout, memory
+limit, and concurrency in each result.
 
 ## Minimal local tests
 
