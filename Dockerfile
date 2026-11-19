@@ -105,6 +105,7 @@ RUN chmod +x /root/destiva/build-alive.sh && BUILD_JOBS=${BUILD_JOBS} /root/dest
 RUN apt-get update && apt-get install -y --no-install-recommends \
     parallel \
     python3-matplotlib \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Benchmark-preparation tooling: compiles each benchmark's C source to
@@ -122,6 +123,10 @@ COPY tires.sh /root/destiva/tires.sh
 # Analysis scripts + the authors' full experimental results, so tables/figures
 # can be regenerated without rerunning the sweep.
 COPY analysis /root/destiva/analysis
+
+# Extension-study tooling. Phase 2 uses the built LLVM/Alive2 binaries above
+# but keeps manifests and result files under mp/phase2.
+COPY mp /root/destiva/mp
 
 # Everything else in the repo not already copied above.
 COPY README.md /root/destiva/README.md

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nntzuekai/destiva/mp/phase2/schema.json",
+  "title": "DESTIVA Phase 2 segment manifest record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "segment_id",
+    "benchmark",
+    "function",
+    "relative_ir",
+    "pass_count",
+    "start_index",
+    "end_index",
+    "selected_by",
+    "features"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "segment_id": {"type": "string"},
+    "benchmark": {"type": "string"},
+    "function": {"type": "string"},
+    "relative_ir": {"type": "string"},
+    "relative_passes": {"type": "string"},
+    "pass_count": {"type": "integer", "minimum": 2},
+    "start_index": {"type": "integer", "minimum": 0},
+    "end_index": {"type": "integer", "minimum": 1},
+    "index_pair": {"type": "string", "pattern": "^[0-9]+:[0-9]+$"},
+    "selected_by": {
+      "type": "array",
+      "items": {
+        "enum": ["end_to_end", "all_passes", "mean", "median", "top2", "fixed", "dynamic_four", "dynamic"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "features": {
+      "type": "object",
+      "required": [
+        "segment_span",
+        "segment_diff_total",
+        "segment_modified_pass_count",
+        "segment_start_pass",
+        "segment_end_pass"
+      ]
+    }
+  }
+}
