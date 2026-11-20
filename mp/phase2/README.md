@@ -12,22 +12,29 @@ runs are intended for the experiment server, not a development machine.
 
 1. `make_manifest.py` reproduces DESTIVA's temporal heuristics and builds a
    deterministic, heuristic-balanced segment sample.
-2. `extract_boundary_features.py` runs LLVM once per selected function and
-   extracts instruction, operand, memory, CFG, and dependency features from
-   the intermediate IR at both ends of every selected segment.
-3. `run_segments.py` validates one exact segment per process, with wall-time
-   and memory limits, resumable JSONL output, repeated runs, and explicit
-   temporal or combined spatial-temporal modes.
+2. `extract_boundary_features.py` first requires the live LLVM pass sequence
+   to exactly match each function's `_passes.json`. It then persists the exact
+   post-pass IR at every selected boundary and extracts instruction, operand,
+   memory, CFG, and dependency features.
+3. `run_segments.py` invokes standalone `alive-tv` on each exact start/end IR
+   pair, with internal verification timing, wall-time and memory limits,
+   resumable JSONL output, repeated runs, and temporal or combined modes.
 4. `merge_phase2.py` joins outcomes, segment-diff features, boundary features,
    and original-function features into one CSV.
 5. `qc_report.py` audits completion, duplicate records, verdict categories,
    internal timing telemetry, benchmark coverage, and heuristic coverage.
 
-The branch also adds `-tv-check-index-pairs=START:END` to
-`alive2-decomp/tv/tv.cpp`. Unlike the original name-based option, indexed
-pairs remain unambiguous when passes such as `InstCombinePass` occur several
-times. `-tv-time-verify` emits `PHASE2_TIME` records when indexed pairs are
-used.
+Standalone `alive-tv --time-verify` emits one `PHASE2_TIME` record for the
+named function. The collection runner requires that record for every
+non-timeout result. This avoids relying on LLVM pass-manager callback indices,
+which include adaptor callbacks that are absent from `_passes.json`.
+
+### Incompatible pilot-v1 results
+
+Results created with `-tv-check-index-pairs` are diagnostic only and must not
+be resumed or merged. The corrected runner emits schema version 2 with
+`measurement_method=exact_snapshot_pair_v1` and refuses legacy result files.
+Use new boundary, result, QC, and dataset filenames for corrected runs.
 
 ## Observation definition
 
@@ -53,8 +60,8 @@ unsound), `timeout`, `unsupported`, `translation_error`, `crash`, and
 
 ### Docker
 
-The Dockerfile copies `mp/` into the image and compiles the indexed-pair
-validator change. Rebuild the image from the `mp` branch:
+The Dockerfile copies `mp/` into the image and compiles the standalone timing
+instrumentation. Rebuild the image from the `mp` branch:
 
 ```sh
 git switch mp
@@ -82,21 +89,21 @@ sudo apt-get install -y \
 ```
 
 Build LLVM, Z3, and Alive2 using the native setup in the repository's main
-README. If the project is already built, rebuild Alive2 so the Phase 2 indexed
-segment selector added to `tv.cpp` is included:
+README. LLVM must be the pinned commit documented there. If the project is
+already built, rebuild Alive2 so the standalone timing instrumentation is
+included:
 
 ```sh
 cmake --build alive2-decomp/build -j 16
-alive2-decomp/build/opt-alive-test.sh --help | \
-  grep tv-check-index-pairs
-mkdir -p mp/phase2/work mp/phase2/results
+alive2-decomp/build/alive-tv --help 2>&1 | grep time-verify
+mkdir -p mp/phase2/work
 ```
 
 `util-linux` supplies `prlimit`, which the experiment driver uses to impose a
 per-process memory limit. By default the scripts look for LLVM at
-`llvm-project/build/bin/opt` and Alive2 at
-`alive2-decomp/build/opt-alive-test.sh`; override those paths with `--opt` and
-`--opt-alive` if your native builds are elsewhere.
+`llvm-project/build/bin/opt` and standalone Alive2 at
+`alive2-decomp/build/alive-tv`; override those paths with `--opt` and
+`--alive-tv` if your native builds are elsewhere.
 
 ## 1. Create a pilot manifest
 
@@ -139,18 +146,33 @@ Use `--max-segments-per-function 0` to retain the complete union of segments
 selected by the requested heuristics. This still does not enumerate arbitrary
 O(N²) pass pairs.
 
-## 2. Extract intermediate-boundary features
+## 2. Preflight and materialize exact boundaries
 
 ```sh
 python3 mp/phase2/extract_boundary_features.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --output mp/phase2/work/pilot_boundary_features.jsonl
+  --output mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --snapshots-dir mp/phase2/work/pilot_v2_snapshots
 ```
 
 LLVM is invoked once per function, not once per segment. Feature extraction
-then reuses each requested intermediate state for every segment that shares
-that boundary. The metadata file reports pass-count or pass-name alignment
-failures; these must be zero before using boundary features.
+reuses each requested intermediate state for every segment sharing that
+boundary. Start/end snapshot paths and SHA-256 hashes are stored in every
+boundary record.
+
+This command is a hard preflight gate. It exits nonzero unless the live pass
+count and every pass name exactly match `_passes.json`. On success,
+`pilot_v2_boundary_features.metadata.json` must report:
+
+- `complete: true`;
+- `alignment_error_count: 0`;
+- equal `requested_functions`, `aligned_functions`, and `completed_functions`;
+- equal `requested_segments` and `segment_count`; and
+- an empty `errors` array.
+
+If it fails, do not run validation. Confirm that `llvm-project` is at the
+pinned commit from the main README and rebuild LLVM. The metadata identifies
+the first differing pass for every affected function.
 
 For a smoke check, add `--limit-functions 2` and use a separate output file.
 
@@ -162,7 +184,8 @@ not invoke LLVM, Alive2, or Z3:
 ```sh
 python3 mp/phase2/run_segments.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --output mp/phase2/work/pilot_temporal_results.jsonl \
+  --boundary-features mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --output mp/phase2/work/pilot_v2_temporal_results.jsonl \
   --jobs 8
 ```
 
@@ -171,23 +194,27 @@ python3 mp/phase2/run_segments.py \
 ```sh
 python3 mp/phase2/run_segments.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --output mp/phase2/work/pilot_temporal_results.jsonl \
+  --boundary-features mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --output mp/phase2/work/pilot_v2_temporal_results.jsonl \
   --timeout 600 \
   --memory-gb 4 \
   --jobs 8 \
   --execute
 ```
 
-The output is flushed after every completed run. Repeating the same command
-resumes collection by skipping existing `run_id` values. Use `--limit 20` for
-a small live smoke test and `--repeats 3` for a runtime-stability subset.
+Before execution, the runner verifies complete manifest coverage and every
+snapshot hash. The output is flushed after every completed run. Repeating the
+same command resumes collection by skipping existing `run_id` values. Use
+`--limit 20` for a small live smoke test and `--repeats 3` for a
+runtime-stability subset. A legacy result file causes an immediate error.
 
 To measure spatial plus temporal decomposition, use a separate result file:
 
 ```sh
 python3 mp/phase2/run_segments.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --output mp/phase2/work/pilot_combined_results.jsonl \
+  --boundary-features mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --output mp/phase2/work/pilot_v2_combined_results.jsonl \
   --mode combined \
   --timeout 600 --memory-gb 4 --jobs 8 --execute
 ```
@@ -200,18 +227,21 @@ cost populations.
 ```sh
 python3 mp/phase2/qc_report.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --results mp/phase2/work/pilot_temporal_results.jsonl \
-  --output mp/phase2/work/pilot_qc.md
+  --results mp/phase2/work/pilot_v2_temporal_results.jsonl \
+  --boundary-features mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --output mp/phase2/work/pilot_v2_qc.md
 
 python3 mp/phase2/merge_phase2.py \
   --manifest mp/phase2/work/pilot_manifest.jsonl \
-  --results mp/phase2/work/pilot_temporal_results.jsonl \
-  --boundary-features mp/phase2/work/pilot_boundary_features.jsonl \
-  --output mp/phase2/work/pilot_dataset.csv
+  --results mp/phase2/work/pilot_v2_temporal_results.jsonl \
+  --boundary-features mp/phase2/work/pilot_v2_boundary_features.jsonl \
+  --output mp/phase2/work/pilot_v2_dataset.csv
 ```
 
-Do not proceed to modeling if the QC report shows pass alignment failures,
-unknown segments, duplicate runs, or no internal `PHASE2_TIME` telemetry.
+`qc_report.py` exits nonzero unless the report status is `PASS`.
+`merge_phase2.py` independently refuses incomplete boundary coverage, legacy
+or mixed measurement methods, snapshot-digest mismatches, invalid runs, and
+non-timeout runs lacking internal timing.
 
 ## Scaling beyond the pilot
 
@@ -232,8 +262,9 @@ limit, and concurrency in each result.
 ## Minimal local tests
 
 The tests exercise heuristic equivalence, deterministic sampling, manifest
-construction, boundary-dump parsing, indexed command construction, and
-verdict classification. They do not run the validator:
+construction, strict pass alignment, snapshot hashes, exact-pair command
+construction, legacy-result rejection, and verdict classification. They do
+not run the validator:
 
 ```sh
 python3 -m unittest discover -s mp/phase2/tests -v
@@ -245,8 +276,8 @@ python3 -m unittest discover -s mp/phase2/tests -v
 | --- | --- |
 | `phase2_common.py` | Heuristics, sampling, IDs, segment features, JSONL helpers. |
 | `make_manifest.py` | Deterministic function and segment manifest generation. |
-| `extract_boundary_features.py` | Intermediate LLVM IR feature extraction. |
-| `run_segments.py` | Resumable, parallel, resource-limited validation runner. |
+| `extract_boundary_features.py` | Strict pass preflight, exact snapshots, and boundary features. |
+| `run_segments.py` | Resumable standalone `alive-tv` exact-pair runner. |
 | `merge_phase2.py` | Join manifest, outcomes, boundary, and function features. |
 | `qc_report.py` | Collection integrity and coverage report. |
 | `schema.json` | Manifest record schema. |

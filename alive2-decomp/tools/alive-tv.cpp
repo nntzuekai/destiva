@@ -9,6 +9,7 @@
 #include "llvm_util/utils.h"
 #include "smt/smt.h"
 #include "tools/transform.h"
+#include "util/stopwatch.h"
 #include "util/version.h"
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -28,6 +29,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 #include <utility>
@@ -240,6 +242,14 @@ and "tgt5" will unused.
         M2_anon_count++;
       if ((F1.getName().empty() && (M1_anon_count == M2_anon_count)) ||
           (F1.getName() == F2.getName())) {
+        optional<ScopedWatch> phase2_timer;
+        if (opt_elapsed_time) {
+          string timed_function = F1.getName().str();
+          phase2_timer.emplace([timed_function](const StopWatch &sw) {
+            *out << "PHASE2_TIME: function=" << timed_function
+                 << " seconds=" << sw.seconds() << "\n";
+          });
+        }
         if (opt_decompose) {
           auto touched_pre_raw  = llvm_util::computeTouchedPre(
               const_cast<llvm::Function &>(F1), const_cast<llvm::Function &>(F2));

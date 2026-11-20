@@ -21,7 +21,6 @@
 #include "util/stopwatch.h"
 #include "util/version.h"
 #include "llvm/ADT/Any.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
@@ -95,12 +94,6 @@ llvm::cl::opt<string> check_pairs("tv-check-pairs",
   llvm::cl::desc("Verify only specified pass pairs (format: PassA:PassB,PassC:PassD,...)"),
   llvm::cl::cat(alive_cmdargs));
 
-llvm::cl::opt<string> check_index_pairs("tv-check-index-pairs",
-  llvm::cl::desc("Verify only specified zero-based pass-index pairs "
-                 "(format: 12:37,40:52). Intended for reproducible "
-                 "segment-level experiments where pass names may repeat."),
-  llvm::cl::cat(alive_cmdargs));
-
 llvm::cl::opt<bool> decompose("decompose",
   llvm::cl::desc("Enable decomposition mode"),
   llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));
@@ -132,9 +125,6 @@ string pass_name;
 
 static unordered_set<string> pairs_starts;
 static unordered_set<string> pairs_ends;
-static unordered_set<long> index_pairs_starts;
-static unordered_set<long> index_pairs_ends;
-static long pass_index = -1;
 
 static void parse_pairs() {
   static bool parsed = false;
@@ -148,32 +138,6 @@ static void parse_pairs() {
     pairs_starts.insert(pair.substr(0, colon));
     pairs_ends.insert(pair.substr(colon + 1));
   }
-}
-
-static void parse_index_pairs() {
-  static bool parsed = false;
-  if (parsed) return;
-  parsed = true;
-  stringstream ss(check_index_pairs.getValue());
-  string pair;
-  while (getline(ss, pair, ',')) {
-    auto colon = pair.find(':');
-    if (colon == string::npos) continue;
-    long start = -1;
-    long end = -1;
-    bool invalid_start = llvm::StringRef(pair).take_front(colon)
-                           .getAsInteger(10, start);
-    bool invalid_end = llvm::StringRef(pair).drop_front(colon + 1)
-                         .getAsInteger(10, end);
-    if (!invalid_start && !invalid_end && start >= 0 && end > start) {
-      index_pairs_starts.insert(start);
-      index_pairs_ends.insert(end);
-    }
-  }
-}
-
-static bool pairs_enabled() {
-  return !check_pairs.empty() || !check_index_pairs.empty();
 }
 
 void sigalarm_handler(int) {
@@ -273,12 +237,7 @@ struct TVLegacyPass final : public llvm::ModulePass {
     optional<ScopedWatch> timer;
     if (opt_elapsed_time)
       timer.emplace([&](const StopWatch &sw) {
-        if (!check_index_pairs.empty())
-          *out << "PHASE2_TIME: index=" << pass_index
-               << " pass=" << pass_name
-               << " seconds=" << sw.seconds() << "\n";
-        else
-          *out << "Took " << sw.seconds() << "s\n";
+        *out << "Took " << sw.seconds() << "s\n";
       });
 
     llvm::TargetLibraryInfo *TLI = nullptr;
@@ -914,18 +873,10 @@ struct TVPass : public llvm::PassInfoMixin<TVPass> {
       bool pairs_skip = false;
       bool pairs_start = false;
 
-      if (pairs_enabled()) {
-        bool is_end = false;
-        bool is_start = false;
-        if (!check_index_pairs.empty()) {
-          parse_index_pairs();
-          is_end = index_pairs_ends.count(pass_index) > 0;
-          is_start = index_pairs_starts.count(pass_index) > 0;
-        } else {
-          parse_pairs();
-          is_end = pairs_ends.count(pass_name) > 0;
-          is_start = pairs_starts.count(pass_name) > 0;
-        }
+      if (!check_pairs.empty()) {
+        parse_pairs();
+        bool is_end   = pairs_ends.count(pass_name) > 0;
+        bool is_start = pairs_starts.count(pass_name) > 0;
         if (!is_end && !is_start) {
           nop = true;
           pairs_skip = true;
@@ -1105,7 +1056,7 @@ llvmGetPassPluginInfo() {
         // (initial -> first_checkpoint) can be verified.
         instrument->registerBeforeNonSkippedPassCallback(
           [run_tv](llvm::StringRef P, llvm::Any IR) {
-            if (!pairs_enabled()) {
+            if (check_pairs.empty()) {
               run_tv(P, IR);
             } else {
               pass_name = P.str();
@@ -1122,7 +1073,6 @@ llvmGetPassPluginInfo() {
         instrument->registerAfterPassCallback(
           [run_tv](llvm::StringRef P, llvm::Any IR,
              const llvm::PreservedAnalyses &PA) {
-            ++pass_index;
             return run_tv(P, IR);
         });
       }
