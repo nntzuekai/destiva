@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Collect a live LLVM pass trace and build a self-contained Phase 2 manifest.
+
+This is the authoritative Phase 2 preprocessing stage.  It does not read the
+artifact's pre-generated ``*_passes.json`` files.  One instrumented ``opt``
+run per function supplies the live pass order, instruction identities,
+per-pass change characteristics, whole-state characteristics, and exact IR
+snapshots needed by the sampled temporal segments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Iterable
+
+from phase2_common import (
+    DEFAULT_HEURISTICS,
+    HEURISTICS,
+    collect_candidates,
+    read_jsonl,
+    segment_features,
+    segment_id,
+    select_candidates,
+    stable_order_key,
+)
+
+
+SCHEMA_VERSION = 3
+PROFILE_METHOD = "live_instrumented_llvm_trace_v1"
+SNAPSHOT_METHOD = "live_post_pass_ir_v1"
+NOISE_RE = re.compile(r";\d+$")
+HEADER_RE = re.compile(r"^\s*;\s*\*\*\* IR Dump (Before|After) (.+?) on ")
+STAR_RE = re.compile(r"^\s*;\s*\*\*\*")
+MD_STRING_RE = re.compile(r'^!(\d+)\s*=\s*!\{!"(\d+)"\}\s*$')
+MD_INT_RE = re.compile(r"^!(\d+)\s*=\s*!\{i\d+\s+(\d+)\}\s*$")
+MYMD_RE = re.compile(r"!mymd\s+!(\d+)")
+MODULE_METADATA_RE = re.compile(r"^!\d+\s*=")
+TRAILING_METADATA_RE = re.compile(r",\s*![A-Za-z0-9_.-]+\s+!\d+.*$")
+LOCAL_RE = re.compile(r'%(?:[-A-Za-z$._0-9]+|"[^"]+")')
+GLOBAL_RE = re.compile(r'@(?:[-A-Za-z$._0-9]+|"[^"]+")')
+INT_TYPE_RE = re.compile(r"\bi(\d+)\b")
+VECTOR_TYPE_RE = re.compile(r"<\s*(\d+)\s+x\s+[^>]+>")
+NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9_.$!%])(?:[-+]?\d+(?:\.\d*)?|0x[0-9A-Fa-f]+)(?![A-Za-z0-9_.$])"
+)
+
+
+def clean_dump_lines(lines: list[str]) -> str:
+    """Discard tracking diagnostics that older patched LLVM builds emitted."""
+    last_metadata = max(
+        (index for index, line in enumerate(lines) if MODULE_METADATA_RE.match(line)),
+        default=-1,
+    )
+    if last_metadata >= 0:
+        lines = lines[:last_metadata + 1]
+    return "\n".join(line for line in lines if line.strip() != "Overload not found")
+
+
+def parse_sections(dump_text: str) -> list[tuple[str, str, str]]:
+    sections: list[tuple[str, str, str]] = []
+    direction: str | None = None
+    pass_name: str | None = None
+    lines: list[str] = []
+    for line in dump_text.splitlines():
+        match = HEADER_RE.match(line)
+        if match:
+            if direction is not None and pass_name is not None:
+                sections.append((direction, pass_name, clean_dump_lines(lines)))
+            direction, pass_name = match.groups()
+            lines = []
+        elif STAR_RE.match(line):
+            if direction is not None and pass_name is not None:
+                sections.append((direction, pass_name, clean_dump_lines(lines)))
+            direction = pass_name = None
+            lines = []
+        elif direction is not None and not NOISE_RE.search(line):
+            lines.append(line)
+    if direction is not None and pass_name is not None:
+        sections.append((direction, pass_name, clean_dump_lines(lines)))
+    return sections
+
+
+def pair_sections(sections: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """Return adjacent, same-name before/after leaf-pass dumps."""
+    pairs: list[tuple[str, str, str]] = []
+    index = 0
+    while index < len(sections):
+        current = sections[index]
+        if (
+            current[0] == "Before"
+            and index + 1 < len(sections)
+            and sections[index + 1][0] == "After"
+            and current[1] == sections[index + 1][1]
+        ):
+            pairs.append((current[1], current[2], sections[index + 1][2]))
+            index += 2
+        else:
+            index += 1
+    return pairs
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stored_path(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def tool_output(command: list[str], cwd: Path | None = None) -> str:
+    run = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    return (run.stdout + run.stderr).strip()
+
+
+def load_function_paths(path: Path) -> list[str]:
+    values = []
+    for line in path.read_text().splitlines():
+        value = line.strip()
+        if value and not value.startswith("#"):
+            values.append(value if value.endswith(".ll") else value + ".ll")
+    return values
+
+
+def sample_functions(paths: list[str], count: int, seed: int) -> list[str]:
+    if count <= 0 or count >= len(paths):
+        return sorted(paths)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for path in paths:
+        groups[Path(path).parts[0]].append(path)
+    for benchmark, values in groups.items():
+        values.sort(key=lambda value: stable_order_key(seed, benchmark, value))
+    offsets: Counter[str] = Counter()
+    selected: list[str] = []
+    while len(selected) < count:
+        progressed = False
+        for benchmark in sorted(groups):
+            offset = offsets[benchmark]
+            if offset < len(groups[benchmark]):
+                selected.append(groups[benchmark][offset])
+                offsets[benchmark] += 1
+                progressed = True
+                if len(selected) == count:
+                    break
+        if not progressed:
+            break
+    return selected
+
+
+def metadata_ids(ir_text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in ir_text.splitlines():
+        match = MD_STRING_RE.match(line.strip()) or MD_INT_RE.match(line.strip())
+        if match:
+            result[match.group(1)] = match.group(2)
+    return result
+
+
+def tracked_instruction_map(
+    ir_text: str, function: str, find_function, logical_instructions,
+) -> dict[str, tuple[str, str]]:
+    """Map stable ``!mymd`` IDs to (opcode, canonical instruction text)."""
+    md_ids = metadata_ids(ir_text)
+    _, body = find_function(ir_text.splitlines(), function)
+    result: dict[str, tuple[str, str]] = {}
+    untracked = 0
+    for value, opcode, rhs in logical_instructions(body):
+        text = f"{value} = {rhs}" if value else rhs
+        attachment = MYMD_RE.search(text)
+        if attachment is None or attachment.group(1) not in md_ids:
+            untracked += 1
+            continue
+        stable_id = md_ids[attachment.group(1)]
+        if stable_id in result:
+            raise ValueError(f"duplicate !mymd instruction ID {stable_id} in @{function}")
+        result[stable_id] = (opcode, TRAILING_METADATA_RE.sub("", text).strip())
+    if untracked:
+        raise ValueError(f"{untracked} instructions in @{function} lack resolvable !mymd IDs")
+    return result
+
+
+def summarize_instructions(records: Iterable[tuple[str, str]]) -> dict[str, int]:
+    rows = list(records)
+    opcodes = Counter(opcode for opcode, _ in rows)
+    text = "\n".join(value for _, value in rows)
+    categories = {
+        "arithmetic": {"add", "fadd", "sub", "fsub", "mul", "fmul", "udiv", "sdiv", "fdiv", "urem", "srem", "frem"},
+        "bitwise": {"shl", "lshr", "ashr", "and", "or", "xor"},
+        "comparison": {"icmp", "fcmp"},
+        "conversion": {"trunc", "zext", "sext", "fptrunc", "fpext", "fptoui", "fptosi", "uitofp", "sitofp", "ptrtoint", "inttoptr", "bitcast", "addrspacecast"},
+        "memory": {"alloca", "load", "store", "fence", "cmpxchg", "atomicrmw", "getelementptr"},
+        "control": {"ret", "br", "switch", "indirectbr", "invoke", "callbr", "resume", "unreachable"},
+        "call": {"call", "invoke", "callbr"},
+        "vector": {"extractelement", "insertelement", "shufflevector"},
+    }
+    result: dict[str, int] = {"instruction_count": len(rows)}
+    for opcode, count in sorted(opcodes.items()):
+        result[f"opcode_{opcode}_count"] = count
+    for name, members in categories.items():
+        result[f"category_{name}_count"] = sum(opcodes[item] for item in members)
+    int_widths = [int(value) for value in INT_TYPE_RE.findall(text)]
+    result.update({
+        "local_operand_references": len(LOCAL_RE.findall(text)),
+        "global_operand_references": len(GLOBAL_RE.findall(text)),
+        "constant_mentions": len(NUMBER_RE.findall(text)),
+        "integer_type_mentions": len(int_widths),
+        "wide_integer_mentions": sum(value >= 64 for value in int_widths),
+        "pointer_type_mentions": len(re.findall(r"\bptr\b", text)),
+        "float_type_mentions": sum(len(re.findall(rf"\b{name}\b", text)) for name in ("half", "bfloat", "float", "double", "fp128", "x86_fp80", "ppc_fp128")),
+        "vector_type_mentions": len(VECTOR_TYPE_RE.findall(text)),
+        "volatile_instruction_count": len(re.findall(r"\bvolatile\b", text)),
+        "atomic_instruction_count": len(re.findall(r"\batomic\b", text)) + opcodes["atomicrmw"] + opcodes["cmpxchg"],
+        "memory_intrinsic_call_count": len(re.findall(r"@llvm\.(?:memcpy|memmove|memset)", text)),
+        "special_value_mentions": sum(len(re.findall(rf"\b{name}\b", text)) for name in ("undef", "poison", "null")),
+    })
+    return result
+
+
+def change_summary(
+    before: str, after: str, function: str, find_function, logical_instructions,
+) -> dict[str, object]:
+    pre = tracked_instruction_map(before, function, find_function, logical_instructions)
+    post = tracked_instruction_map(after, function, find_function, logical_instructions)
+    pre_ids, post_ids = set(pre), set(post)
+    removed = pre_ids - post_ids
+    added = post_ids - pre_ids
+    modified = {key for key in pre_ids & post_ids if pre[key][1] != post[key][1]}
+    groups = {
+        "removed": (pre[key] for key in removed),
+        "added": (post[key] for key in added),
+        "modified_pre": (pre[key] for key in modified),
+        "modified_post": (post[key] for key in modified),
+        "touched_pre": (pre[key] for key in removed | modified),
+        "touched_post": (post[key] for key in added | modified),
+    }
+    features: dict[str, int] = {}
+    for prefix, records in groups.items():
+        for key, value in summarize_instructions(records).items():
+            features[f"{prefix}_{key}"] = value
+    return {
+        "before_instruction_count": len(pre),
+        "after_instruction_count": len(post),
+        "removed_count": len(removed),
+        "added_count": len(added),
+        "modified_count": len(modified),
+        "diff": len(removed) + len(added) + len(modified),
+        "features": features,
+    }
+
+
+def flatten_boundary_features(start: dict[str, object], end: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key in sorted(set(start) | set(end)):
+        start_value = start.get(key, 0)
+        end_value = end.get(key, 0)
+        result[f"start_{key}"] = start_value
+        result[f"end_{key}"] = end_value
+        if isinstance(start_value, (int, float)) and isinstance(end_value, (int, float)):
+            result[f"delta_{key}"] = end_value - start_value
+            result[f"abs_delta_{key}"] = abs(end_value - start_value)
+    return result
+
+
+def cumulative_change_features(passes: list[dict[str, object]], start: int, end: int) -> dict[str, int | float]:
+    result: Counter[str] = Counter()
+    for entry in passes[start + 1:end + 1]:
+        for key, value in entry["change_features"].items():
+            if isinstance(value, (int, float)):
+                result[f"cumulative_{key}"] += value
+    return dict(result)
+
+
+def write_snapshot(path: Path, text: str) -> tuple[str, str]:
+    normalized = text.rstrip() + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(normalized)
+    return normalized, text_sha256(normalized)
+
+
+def append_jsonl(path: Path, record: dict[str, object]) -> None:
+    with path.open("a") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+        stream.flush()
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "mp" / "phase1"))
+    from phase1_extract import find_function, ir_features_text, logical_instructions
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=root)
+    parser.add_argument("--functions", type=Path, default=root / "benchmarks" / "funcs" / "acyclic.txt")
+    parser.add_argument("--profiles", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--snapshots-dir", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, default=root / "llvm-project" / "build" / "bin" / "opt")
+    parser.add_argument("--sample-functions", type=int, default=60)
+    parser.add_argument("--limit-functions", type=int, default=0)
+    parser.add_argument("--max-segments-per-function", type=int, default=12)
+    parser.add_argument("--heuristics", nargs="+", choices=HEURISTICS, default=list(DEFAULT_HEURISTICS))
+    parser.add_argument("--seed", type=int, default=20261119)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+    if args.resume and args.overwrite:
+        raise SystemExit("--resume and --overwrite are mutually exclusive")
+    for name in ("root", "functions", "profiles", "manifest", "snapshots_dir", "opt"):
+        setattr(args, name, getattr(args, name).resolve())
+    if not args.opt.is_file():
+        raise SystemExit(f"LLVM opt not found: {args.opt}")
+
+    paths = sample_functions(load_function_paths(args.functions), args.sample_functions, args.seed)
+    if args.limit_functions > 0:
+        paths = paths[:args.limit_functions]
+    args.profiles.parent.mkdir(parents=True, exist_ok=True)
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    args.snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_profiles = read_jsonl(args.profiles)
+    existing_manifest = read_jsonl(args.manifest)
+    if args.overwrite:
+        existing_profiles = []
+        existing_manifest = []
+        args.profiles.write_text("")
+        args.manifest.write_text("")
+    elif (existing_profiles or existing_manifest) and not args.resume:
+        raise SystemExit("outputs already contain records; use --resume or choose new filenames")
+    elif not args.profiles.exists():
+        args.profiles.write_text("")
+    if not args.manifest.exists():
+        args.manifest.write_text("")
+
+    profile_by_ir: dict[str, dict[str, object]] = {}
+    for row in existing_profiles:
+        relative_ir = str(row.get("relative_ir", ""))
+        if not relative_ir or relative_ir in profile_by_ir or row.get("schema_version") != SCHEMA_VERSION:
+            raise SystemExit(f"invalid or duplicate live profile for {relative_ir!r}")
+        profile_by_ir[relative_ir] = row
+    manifest_by_ir: dict[str, list[dict[str, object]]] = defaultdict(list)
+    seen_segments: set[str] = set()
+    for row in existing_manifest:
+        segment = str(row.get("segment_id", ""))
+        if not segment or segment in seen_segments or row.get("schema_version") != SCHEMA_VERSION:
+            raise SystemExit(f"invalid or duplicate live segment {segment!r}")
+        seen_segments.add(segment)
+        manifest_by_ir[str(row["relative_ir"])].append(row)
+    if set(profile_by_ir) != set(manifest_by_ir):
+        raise SystemExit("resume files disagree on completed functions")
+
+    errors: list[dict[str, object]] = []
+    for number, relative_ir in enumerate(paths, 1):
+        if relative_ir in profile_by_ir:
+            print(f"[{number}/{len(paths)}] {relative_ir}: already collected", flush=True)
+            continue
+        ir_path = args.root / "benchmarks" / "funcs" / relative_ir
+        if not ir_path.is_file():
+            errors.append({"relative_ir": relative_ir, "error": "IR file not found"})
+            continue
+        function = ir_path.stem
+        command = [
+            str(args.opt), "-passes=default<O3>", "--print-before-all",
+            "--print-after-all", "--print-module-scope", "-disable-output", str(ir_path),
+        ]
+        print(f"[{number}/{len(paths)}] tracing {relative_ir}", flush=True)
+        run = subprocess.run(command, capture_output=True, text=True)
+        pairs = pair_sections(parse_sections(run.stderr))
+        if run.returncode != 0 or not pairs:
+            errors.append({
+                "relative_ir": relative_ir,
+                "error": "opt failed or produced no paired leaf-pass dumps",
+                "returncode": run.returncode,
+                "stderr_tail": run.stderr[-4000:],
+            })
+            continue
+        try:
+            occurrences: Counter[str] = Counter()
+            passes: list[dict[str, object]] = []
+            for index, (name, before, after) in enumerate(pairs):
+                changes = change_summary(before, after, function, find_function, logical_instructions)
+                occurrence = occurrences[name]
+                occurrences[name] += 1
+                passes.append({
+                    "index": index,
+                    "name": name,
+                    "occurrence": occurrence,
+                    "diff": changes["diff"],
+                    "removed": changes["removed_count"],
+                    "added": changes["added_count"],
+                    "modified": changes["modified_count"],
+                    "n_input": changes["before_instruction_count"],
+                    "change_features": changes["features"],
+                })
+
+            candidates = collect_candidates(passes, args.heuristics)
+            chosen = sorted(select_candidates(
+                candidates, args.max_segments_per_function, args.seed, relative_ir,
+            ))
+            if not chosen:
+                raise ValueError("live pipeline yielded no candidate segments")
+            endpoint_indices = sorted({value for pair in chosen for value in pair})
+            snapshot_data: dict[int, tuple[str, str]] = {}
+            state_features: dict[int, dict[str, int | float]] = {}
+            base = args.snapshots_dir / Path(relative_ir).with_suffix("")
+            for index in endpoint_indices:
+                snapshot_path = base / f"after-{index:04d}.ll"
+                _, digest = write_snapshot(snapshot_path, pairs[index][2])
+                snapshot_data[index] = (stored_path(snapshot_path, args.root), digest)
+                state_features[index] = ir_features_text(pairs[index][2], function)
+
+            input_features = ir_features_text(pairs[0][1], function)
+            profile = {
+                "schema_version": SCHEMA_VERSION,
+                "profile_method": PROFILE_METHOD,
+                "relative_ir": relative_ir,
+                "benchmark": Path(relative_ir).parts[0],
+                "function": function,
+                "pipeline": "default<O3>",
+                "pass_count": len(passes),
+                "input_features": input_features,
+                "pass_sequence_sha256": text_sha256("\0".join(str(row["name"]) for row in passes)),
+                "passes": passes,
+            }
+            profile_json = json.dumps(profile, sort_keys=True)
+            profile_digest = text_sha256(profile_json + "\n")
+            segments: list[dict[str, object]] = []
+            for start, end in chosen:
+                start_path, start_hash = snapshot_data[start]
+                end_path, end_hash = snapshot_data[end]
+                net = change_summary(
+                    pairs[start][2], pairs[end][2], function, find_function, logical_instructions,
+                )
+                features = segment_features(passes, start, end)
+                features.update(cumulative_change_features(passes, start, end))
+                features.update({f"net_{key}": value for key, value in net["features"].items()})
+                features.update({
+                    "net_removed_count": net["removed_count"],
+                    "net_added_count": net["added_count"],
+                    "net_modified_count": net["modified_count"],
+                    "net_diff": net["diff"],
+                })
+                segments.append({
+                    "schema_version": SCHEMA_VERSION,
+                    "profile_method": PROFILE_METHOD,
+                    "snapshot_method": SNAPSHOT_METHOD,
+                    "profile_record_sha256": profile_digest,
+                    "segment_id": segment_id(relative_ir, start, end),
+                    "benchmark": Path(relative_ir).parts[0],
+                    "function": function,
+                    "relative_ir": relative_ir,
+                    "pass_count": len(passes),
+                    "start_index": start,
+                    "end_index": end,
+                    "index_pair": f"{start}:{end}",
+                    "start_pass": passes[start]["name"],
+                    "start_occurrence": passes[start]["occurrence"],
+                    "end_pass": passes[end]["name"],
+                    "end_occurrence": passes[end]["occurrence"],
+                    "selected_by": sorted(candidates[(start, end)]),
+                    "start_snapshot": start_path,
+                    "end_snapshot": end_path,
+                    "start_snapshot_sha256": start_hash,
+                    "end_snapshot_sha256": end_hash,
+                    "input_features": input_features,
+                    "features": features,
+                    "boundary_features": flatten_boundary_features(
+                        state_features[start], state_features[end],
+                    ),
+                })
+        except Exception as error:
+            errors.append({"relative_ir": relative_ir, "error": str(error)})
+            continue
+
+        append_jsonl(args.profiles, profile)
+        for segment in segments:
+            append_jsonl(args.manifest, segment)
+        profile_by_ir[relative_ir] = profile
+        manifest_by_ir[relative_ir] = segments
+        print(
+            f"[{number}/{len(paths)}] {relative_ir}: {len(passes)} live passes, "
+            f"{len(segments)} segments, {len(endpoint_indices)} snapshots",
+            flush=True,
+        )
+
+    missing = sorted(set(paths) - set(profile_by_ir))
+    extra = sorted(set(profile_by_ir) - set(paths))
+    complete = not errors and not missing and not extra
+    llvm_commit = (
+        tool_output(["git", "rev-parse", "HEAD"], cwd=args.root / "llvm-project")
+        if (args.root / "llvm-project" / ".git").exists() else "unknown"
+    )
+    common_metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "complete": complete,
+        "profile_method": PROFILE_METHOD,
+        "snapshot_method": SNAPSHOT_METHOD,
+        "functions": str(args.functions),
+        "requested_functions": len(paths),
+        "completed_functions": len(set(paths) & set(profile_by_ir)),
+        "sample_functions": args.sample_functions,
+        "max_segments_per_function": args.max_segments_per_function,
+        "heuristics": list(args.heuristics),
+        "seed": args.seed,
+        "opt": str(args.opt),
+        "opt_sha256": file_sha256(args.opt),
+        "opt_version": tool_output([str(args.opt), "--version"]),
+        "llvm_git_commit": llvm_commit,
+        "destiva_git_commit": tool_output(["git", "rev-parse", "HEAD"], cwd=args.root),
+        "tracking_overlay_sha256": file_sha256(
+            Path(__file__).with_name("quiet-tracking-output.patch")
+        ),
+        "pipeline": "default<O3>",
+        "missing_functions": missing,
+        "unexpected_functions": extra,
+        "errors": errors,
+    }
+    profiles_metadata = dict(common_metadata)
+    profiles_metadata.update({
+        "record_count": len(profile_by_ir),
+        "profiles_sha256": file_sha256(args.profiles),
+    })
+    manifest_metadata = dict(common_metadata)
+    manifest_metadata.update({
+        "profiles": str(args.profiles),
+        "profiles_sha256": file_sha256(args.profiles),
+        "segment_count": sum(len(value) for value in manifest_by_ir.values()),
+        "manifest_sha256": file_sha256(args.manifest),
+        "snapshots_dir": str(args.snapshots_dir),
+    })
+    args.profiles.with_suffix(".metadata.json").write_text(
+        json.dumps(profiles_metadata, indent=2, sort_keys=True) + "\n"
+    )
+    args.manifest.with_suffix(".metadata.json").write_text(
+        json.dumps(manifest_metadata, indent=2, sort_keys=True) + "\n"
+    )
+    print(f"profiles: {args.profiles}")
+    print(f"manifest: {args.manifest}")
+    if not complete:
+        raise SystemExit("live collection is incomplete; see manifest metadata and resume after fixing errors")
+
+
+if __name__ == "__main__":
+    main()

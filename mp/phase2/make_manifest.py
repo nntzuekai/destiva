@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Create a deterministic manifest of sampled DESTIVA temporal segments."""
+"""Legacy sidecar-based Phase 2 manifest builder.
+
+New experiments must use ``collect_live.py``. This command remains available
+only for inspecting pilot-v1/v2 data that depended on ``*_passes.json``.
+"""
 
 from __future__ import annotations
 
@@ -150,4 +154,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

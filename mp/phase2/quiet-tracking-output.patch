@@ -1,0 +1,20 @@
+diff --git a/llvm/include/llvm/IR/PassInstrumentation.h b/llvm/include/llvm/IR/PassInstrumentation.h
+--- a/llvm/include/llvm/IR/PassInstrumentation.h
++++ b/llvm/include/llvm/IR/PassInstrumentation.h
+@@ -273,8 +273,6 @@ public:
+ 
+     MDNode *M = I.getMetadata("mymd");
+     if (M != nullptr) {
+-      MDString* MDS =  cast<MDString>(M->getOperand(0));
+-      errs() << I << ";" << MDS->getString() << "\n";
+       return;
+     }
+ 
+@@ -290,7 +288,6 @@ public:
+ 
+   template<typename T>
+   void tagDebugMarkers(const T &) const {
+-    errs() << "Overload not found\n";
+   }
+ 
+   void tagDebugMarkers(const Function &IR) const {

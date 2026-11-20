@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Preflight pass alignment and materialize exact IR segment boundaries."""
+"""Legacy sidecar-aligned Phase 2 boundary extractor.
+
+New experiments must use ``collect_live.py``, which extracts characteristics
+and snapshots from one live LLVM trace without reading ``*_passes.json``.
+"""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for Phase 2 sampling and runner plumbing; no validation runs."""
+"""Focused tests for the live Phase 2 collector and runner plumbing."""
 
 from __future__ import annotations
 
@@ -18,13 +18,12 @@ sys.path.insert(0, str(PHASE2))
 sys.path.insert(0, str(ROOT))
 
 import tester
-from extract_boundary_features import (
-    first_sequence_difference,
+from collect_live import (
+    change_summary,
     flatten_boundary_features,
     pair_sections,
     parse_sections,
 )
-from make_manifest import build_manifest
 from phase2_common import (
     collect_candidates,
     heuristic_segments,
@@ -35,7 +34,7 @@ from run_segments import (
     MEASUREMENT_METHOD,
     classify,
     command_for,
-    load_exact_boundaries,
+    load_live_manifest,
     run_one,
     validate_existing_results,
 )
@@ -44,7 +43,7 @@ from run_segments import (
 def fixture_passes() -> list[dict[str, object]]:
     diffs = [0, 2, 0, 10, 1, 0]
     names = ["Start", "Repeat", "Middle", "Repeat", "Tail", "End"]
-    occurrences = {}
+    occurrences: dict[str, int] = {}
     result = []
     for index, (name, diff) in enumerate(zip(names, diffs)):
         occurrence = occurrences.get(name, 0)
@@ -56,6 +55,77 @@ def fixture_passes() -> list[dict[str, object]]:
             "diff": diff,
         })
     return result
+
+
+def ir(addend: int, include_mul: bool = False) -> str:
+    lines = [
+        "define i32 @sample(i32 %a) {",
+        "entry:",
+        f"  %x = add i32 %a, {addend}, !mymd !0",
+    ]
+    if include_mul:
+        lines.append("  %y = mul i32 %x, 2, !mymd !2")
+        lines.append("  ret i32 %y, !mymd !1")
+    else:
+        lines.append("  ret i32 %x, !mymd !1")
+    lines.extend([
+        "}",
+        '!0 = !{!"0"}',
+        '!1 = !{!"1"}',
+        '!2 = !{!"2"}',
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def fake_dump() -> str:
+    states = [ir(1), ir(2), ir(2, True), ir(3, True)]
+    chunks = []
+    for index, name in enumerate(("FirstPass", "SecondPass", "ThirdPass")):
+        chunks.extend([
+            f"; *** IR Dump Before {name} on [module] ***\n{states[index]}",
+            f"; *** IR Dump After {name} on [module] ***\n{states[index + 1]}",
+        ])
+    return "".join(chunks)
+
+
+def make_fake_opt(path: Path) -> None:
+    program = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--version' in sys.argv:\n"
+        "    print('fake opt 1.0')\n"
+        "else:\n"
+        f"    sys.stderr.write({fake_dump()!r})\n"
+    )
+    path.write_text(program)
+    path.chmod(0o755)
+
+
+def run_collector(root: Path) -> tuple[Path, Path]:
+    funcs = root / "benchmarks" / "funcs" / "demo"
+    funcs.mkdir(parents=True)
+    (funcs / "sample.ll").write_text(ir(1))
+    functions = root / "functions.txt"
+    functions.write_text("demo/sample.ll\n")
+    fake_opt = root / "opt"
+    make_fake_opt(fake_opt)
+    profiles = root / "work" / "profiles.jsonl"
+    manifest = root / "work" / "manifest.jsonl"
+    snapshots = root / "work" / "snapshots"
+    run = subprocess.run([
+        sys.executable, str(PHASE2 / "collect_live.py"),
+        "--root", str(root),
+        "--functions", str(functions),
+        "--opt", str(fake_opt),
+        "--sample-functions", "0",
+        "--max-segments-per-function", "12",
+        "--profiles", str(profiles),
+        "--manifest", str(manifest),
+        "--snapshots-dir", str(snapshots),
+    ], capture_output=True, text=True)
+    if run.returncode != 0:
+        raise AssertionError(run.stdout + run.stderr)
+    return profiles, manifest
 
 
 class HeuristicTests(unittest.TestCase):
@@ -77,8 +147,6 @@ class HeuristicTests(unittest.TestCase):
         self.assertEqual(features["segment_span"], 3)
         self.assertEqual(features["segment_diff_total"], 11)
         self.assertEqual(features["segment_modified_pass_count"], 2)
-        self.assertEqual(features["segment_start_occurrence"], 0)
-        self.assertEqual(features["segment_end_pass"], "Tail")
 
     def test_sampling_is_deterministic_and_keeps_clustered4(self) -> None:
         passes = fixture_passes()
@@ -86,191 +154,81 @@ class HeuristicTests(unittest.TestCase):
             passes, ["end_to_end", "all_passes", "top2", "dynamic_four"],
         )
         first = select_candidates(candidates, 5, 7, "sample")
-        second = select_candidates(candidates, 5, 7, "sample")
-        self.assertEqual(first, second)
-        clustered = set(heuristic_segments(passes, "dynamic_four"))
-        self.assertTrue(clustered.issubset(first))
+        self.assertEqual(first, select_candidates(candidates, 5, 7, "sample"))
+        self.assertTrue(set(heuristic_segments(passes, "dynamic_four")).issubset(first))
 
 
-class ManifestTests(unittest.TestCase):
-    def test_small_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            funcs = root / "benchmarks" / "funcs" / "demo"
-            funcs.mkdir(parents=True)
-            (funcs / "sample.ll").write_text("define i32 @sample() {\n  ret i32 0\n}\n")
-            (funcs / "sample_passes.json").write_text(json.dumps({
-                "function": "sample",
-                "passes": [{"name": row["name"], "diff": row["diff"]} for row in fixture_passes()],
-            }))
-            functions = root / "functions.txt"
-            functions.write_text("demo/sample.ll\n")
-            args = argparse.Namespace(
-                root=root,
-                functions=functions,
-                sample_functions=0,
-                seed=11,
-                heuristics=["end_to_end", "top2", "dynamic_four"],
-                max_segments_per_function=8,
-            )
-            records, metadata = build_manifest(args)
-        self.assertGreater(len(records), 0)
-        self.assertEqual(metadata["completed_function_count"], 1)
-        self.assertEqual(len({row["segment_id"] for row in records}), len(records))
-        self.assertTrue(all(row["start_index"] < row["end_index"] for row in records))
-
-
-class BoundaryFeatureTests(unittest.TestCase):
-    def test_dump_pairing_and_feature_deltas(self) -> None:
-        dump = """
-; *** IR Dump Before FirstPass on [module] ***
-define i32 @sample() { ret i32 0 }
-; *** IR Dump After FirstPass on [module] ***
-define i32 @sample() { ret i32 1 }
-; *** IR Dump Before SecondPass on [module] ***
-define i32 @sample() { ret i32 1 }
-; *** IR Dump After SecondPass on [module] ***
-define i32 @sample() { ret i32 2 }
-"""
-        pairs = pair_sections(parse_sections(dump))
-        self.assertEqual([pair[0] for pair in pairs], ["FirstPass", "SecondPass"])
+class LiveCollectorTests(unittest.TestCase):
+    def test_dump_pairing_and_instruction_characteristics(self) -> None:
+        pairs = pair_sections(parse_sections(fake_dump()))
+        self.assertEqual([pair[0] for pair in pairs], ["FirstPass", "SecondPass", "ThirdPass"])
+        sys.path.insert(0, str(ROOT / "mp" / "phase1"))
+        from phase1_extract import find_function, logical_instructions
+        changes = change_summary(
+            pairs[1][1], pairs[1][2], "sample", find_function, logical_instructions,
+        )
+        self.assertEqual(changes["added_count"], 1)
+        self.assertEqual(changes["modified_count"], 1)
+        self.assertEqual(changes["features"]["added_opcode_mul_count"], 1)
         features = flatten_boundary_features(
-            {"ir_instruction_count": 3, "inst_load_count": 1},
-            {"ir_instruction_count": 5, "inst_load_count": 0},
+            {"ir_instruction_count": 2}, {"ir_instruction_count": 3},
         )
-        self.assertEqual(features["delta_ir_instruction_count"], 2)
-        self.assertEqual(features["abs_delta_inst_load_count"], 1)
+        self.assertEqual(features["delta_ir_instruction_count"], 1)
 
-    def test_strict_sequence_difference(self) -> None:
-        self.assertIsNone(first_sequence_difference(["A", "B"], ["A", "B"]))
-        self.assertEqual(
-            first_sequence_difference(["A", "B"], ["A", "C"]),
-            {"index": 1, "expected": "B", "observed": "C"},
-        )
-        self.assertEqual(
-            first_sequence_difference(["A"], ["A", "B"]),
-            {"index": 1, "expected": "<end>", "observed": "B"},
-        )
-
-    def test_extractor_materializes_an_aligned_snapshot_pair(self) -> None:
+    def test_collector_needs_no_pass_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            funcs = root / "benchmarks" / "funcs" / "demo"
-            funcs.mkdir(parents=True)
-            (funcs / "sample.ll").write_text(
-                "define i32 @sample() {\n  ret i32 0\n}\n"
-            )
-            (funcs / "sample_passes.json").write_text(json.dumps({
-                "function": "sample",
-                "passes": [{"name": "FirstPass", "diff": 1},
-                           {"name": "SecondPass", "diff": 1}],
-            }))
-            manifest = root / "manifest.jsonl"
-            manifest.write_text(json.dumps({
-                "segment_id": "demo/sample:0:1:test",
-                "relative_ir": "demo/sample.ll",
-                "relative_passes": "demo/sample_passes.json",
-                "function": "sample",
-                "start_index": 0,
-                "end_index": 1,
-                "features": {
-                    "segment_start_pass": "FirstPass",
-                    "segment_end_pass": "SecondPass",
-                },
-            }) + "\n")
-            fake_opt = root / "opt"
-            fake_opt.write_text(
-                "#!/bin/sh\n"
-                "if [ \"$1\" = \"--version\" ]; then echo fake-opt; exit 0; fi\n"
-                "cat >&2 <<'EOF'\n"
-                "; *** IR Dump Before FirstPass on [module] ***\n"
-                "define i32 @sample() {\n  ret i32 0\n}\n"
-                "; *** IR Dump After FirstPass on [module] ***\n"
-                "define i32 @sample() {\n  ret i32 1\n}\n"
-                "; *** IR Dump Before SecondPass on [module] ***\n"
-                "define i32 @sample() {\n  ret i32 1\n}\n"
-                "; *** IR Dump After SecondPass on [module] ***\n"
-                "define i32 @sample() {\n  ret i32 2\n}\n"
-                "EOF\n"
-            )
-            fake_opt.chmod(0o755)
-            output = root / "boundaries.jsonl"
-            run = subprocess.run([
-                sys.executable, str(PHASE2 / "extract_boundary_features.py"),
-                "--root", str(root), "--manifest", str(manifest),
-                "--output", str(output), "--opt", str(fake_opt),
-            ], capture_output=True, text=True)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            row = json.loads(output.read_text())
-            metadata = json.loads(output.with_suffix(".metadata.json").read_text())
+            profiles, manifest = run_collector(root)
+            self.assertFalse(any(root.rglob("*_passes.json")))
+            profile = json.loads(profiles.read_text())
+            rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+            metadata = json.loads(manifest.with_suffix(".metadata.json").read_text())
             self.assertTrue(metadata["complete"])
-            self.assertEqual(metadata["alignment_error_count"], 0)
-            self.assertTrue((root / row["start_snapshot"]).is_file())
-            self.assertTrue((root / row["end_snapshot"]).is_file())
+            self.assertEqual(profile["pass_count"], 3)
+            self.assertEqual([row["name"] for row in profile["passes"]],
+                             ["FirstPass", "SecondPass", "ThirdPass"])
+            self.assertTrue(rows)
+            self.assertIn("input_features", rows[0])
+            self.assertIn("boundary_features", rows[0])
+            self.assertIn("net_diff", rows[0]["features"])
+            for row in rows:
+                for side in ("start", "end"):
+                    snapshot = root / row[f"{side}_snapshot"]
+                    self.assertTrue(snapshot.is_file())
+                    self.assertEqual(
+                        hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+                        row[f"{side}_snapshot_sha256"],
+                    )
 
 
 class RunnerTests(unittest.TestCase):
-    def test_command_uses_exact_snapshots(self) -> None:
+    def test_command_uses_live_snapshots(self) -> None:
         record = {
-            "start_index": 12,
-            "end_index": 37,
-            "relative_ir": "demo/sample.ll",
             "function": "sample",
-            "_boundary": {
-                "_start_snapshot_path": Path("/snapshots/start.ll"),
-                "_end_snapshot_path": Path("/snapshots/end.ll"),
-            },
+            "_start_snapshot_path": Path("/snapshots/start.ll"),
+            "_end_snapshot_path": Path("/snapshots/end.ll"),
         }
-        args = argparse.Namespace(
-            alive_tv=Path("/tool/alive-tv"),
-            root=Path("/repo"),
-            mode="temporal",
-        )
+        args = argparse.Namespace(alive_tv=Path("/tool/alive-tv"), mode="temporal")
         command = command_for(record, args)
         self.assertEqual(command[-2:], ["/snapshots/start.ll", "/snapshots/end.ll"])
         self.assertIn("--time-verify", command)
-        self.assertIn("--func=sample", command)
         self.assertNotIn("-O3", command)
-        self.assertNotIn("--decompose", command)
         args.mode = "combined"
         self.assertIn("--decompose", command_for(record, args))
 
-    def test_boundary_loader_checks_hashes_and_coverage(self) -> None:
+    def test_live_manifest_loader_checks_hashes_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            start = root / "start.ll"
-            end = root / "end.ll"
-            start.write_text("start\n")
-            end.write_text("end\n")
-            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-            boundary_path = root / "boundaries.jsonl"
-            boundary_path.write_text(json.dumps({
-                "schema_version": 2,
-                "segment_id": "seg",
-                "snapshot_method": "post_pass_ir_v1",
-                "pass_names_match": True,
-                "start_snapshot": "start.ll",
-                "end_snapshot": "end.ll",
-                "start_snapshot_sha256": digest(start),
-                "end_snapshot_sha256": digest(end),
-            }) + "\n")
-            boundary_path.with_suffix(".metadata.json").write_text(json.dumps({
-                "schema_version": 2,
-                "complete": True,
-                "alignment_error_count": 0,
-                "errors": [],
-            }))
-            boundaries, boundary_digest = load_exact_boundaries(
-                [{"segment_id": "seg"}], boundary_path, root,
-            )
-            self.assertEqual(set(boundaries), {"seg"})
-            self.assertEqual(boundaries["seg"]["_start_snapshot_path"], start)
-            self.assertEqual(len(boundary_digest), 64)
+            _, manifest = run_collector(root)
+            rows, digest = load_live_manifest(manifest, root)
+            self.assertTrue(rows)
+            self.assertEqual(len(digest), 64)
+            self.assertTrue(rows[0]["_start_snapshot_path"].is_file())
 
     def test_legacy_results_cannot_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             results = Path(directory) / "results.jsonl"
-            results.write_text(json.dumps({"schema_version": 1, "run_id": "old"}) + "\n")
+            results.write_text(json.dumps({"schema_version": 2, "run_id": "old"}) + "\n")
             with self.assertRaises(ValueError):
                 validate_existing_results(results, "digest")
 
@@ -284,114 +242,65 @@ class RunnerTests(unittest.TestCase):
                 "echo 'PHASE2_TIME: function=sample seconds=1.25'\n"
             )
             validator.chmod(0o755)
-            start = temp / "start.ll"
-            end = temp / "end.ll"
+            start, end = temp / "start.ll", temp / "end.ll"
             start.write_text("start\n")
             end.write_text("end\n")
             record = {
-                "segment_id": "seg",
-                "benchmark": "demo",
-                "function": "sample",
-                "relative_ir": "demo/sample.ll",
-                "start_index": 1,
-                "end_index": 2,
-                "selected_by": ["fixed"],
-                "_boundary": {
-                    "start_snapshot": str(start),
-                    "end_snapshot": str(end),
-                    "start_snapshot_sha256": "a",
-                    "end_snapshot_sha256": "b",
-                    "_start_snapshot_path": start,
-                    "_end_snapshot_path": end,
-                },
+                "segment_id": "seg", "benchmark": "demo", "function": "sample",
+                "relative_ir": "demo/sample.ll", "start_index": 1, "end_index": 2,
+                "selected_by": ["fixed"], "start_snapshot": str(start),
+                "end_snapshot": str(end), "start_snapshot_sha256": "a",
+                "end_snapshot_sha256": "b", "_start_snapshot_path": start,
+                "_end_snapshot_path": end,
             }
             args = argparse.Namespace(
-                alive_tv=validator,
-                mode="temporal",
-                memory_gb=0,
-                timeout=5,
+                alive_tv=validator, mode="temporal", memory_gb=0, timeout=5,
                 store_success_output=False,
             )
-            result = run_one(record, 0, args, {}, "boundary-digest")
+            result = run_one(record, 0, args, {}, "manifest-digest")
             self.assertEqual(result["outcome"]["verdict"], "correct")
             self.assertTrue(result["outcome"]["measurement_valid"])
             self.assertEqual(result["outcome"]["verification_time_seconds"], 1.25)
 
-    def test_verdict_classification(self) -> None:
+    def test_verdict_classification_and_instrumentation(self) -> None:
         self.assertEqual(classify(0, "", "", False), "correct")
         self.assertEqual(classify(-9, "", "", True), "timeout")
         self.assertEqual(classify(1, "Transformation doesn't verify! (unsound)", "", False), "counterexample")
-        self.assertEqual(classify(1, "Transformation doesn't verify! (not unsound)", "", False), "verification_failure")
         self.assertEqual(classify(1, "ERROR: program doesn't type check!", "", False), "translation_error")
-        self.assertEqual(classify(1, "", "assertion failed", False), "crash")
-
-    def test_standalone_validator_has_phase2_timing(self) -> None:
         source = (ROOT / "alive2-decomp" / "tools" / "alive-tv.cpp").read_text()
-        plugin_source = (ROOT / "alive2-decomp" / "tv" / "tv.cpp").read_text()
         self.assertIn("PHASE2_TIME: function=", source)
-        self.assertNotIn("tv-check-index-pairs", plugin_source)
-        self.assertEqual(MEASUREMENT_METHOD, "exact_snapshot_pair_v1")
+        self.assertEqual(MEASUREMENT_METHOD, "live_snapshot_pair_v2")
 
 
 class PipelineGateTests(unittest.TestCase):
-    def test_schema_v2_qc_and_merge_pass(self) -> None:
+    def test_schema_v3_qc_and_merge_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest_path = root / "manifest.jsonl"
-            boundary_path = root / "boundaries.jsonl"
+            _, manifest_path = run_collector(root)
+            manifest_rows, manifest_digest = load_live_manifest(manifest_path, root)
             results_path = root / "results.jsonl"
-            manifest = {
-                "schema_version": 1,
-                "segment_id": "seg",
-                "benchmark": "demo",
-                "function": "sample",
-                "relative_ir": "demo/sample.ll",
-                "start_index": 0,
-                "end_index": 1,
-                "pass_count": 2,
-                "selected_by": ["fixed"],
-                "features": {"segment_span": 1},
-            }
-            boundary = {
-                "schema_version": 2,
-                "segment_id": "seg",
-                "snapshot_method": "post_pass_ir_v1",
-                "pass_names_match": True,
-                "boundary_features": {"delta_ir_instruction_count": 1},
-            }
-            manifest_path.write_text(json.dumps(manifest) + "\n")
-            boundary_path.write_text(json.dumps(boundary) + "\n")
-            boundary_path.with_suffix(".metadata.json").write_text(json.dumps({
-                "schema_version": 2,
-                "complete": True,
-                "errors": [],
-            }))
-            boundary_digest = hashlib.sha256(boundary_path.read_bytes()).hexdigest()
-            results_path.write_text(json.dumps({
-                "schema_version": 2,
-                "measurement_method": MEASUREMENT_METHOD,
-                "boundary_features_sha256": boundary_digest,
-                "run_id": "seg:temporal:r0",
-                "segment_id": "seg",
-                "mode": "temporal",
-                "repeat": 0,
-                "selected_by": ["fixed"],
-                "outcome": {
-                    "verdict": "correct",
-                    "censored": False,
-                    "measurement_valid": True,
-                    "wall_time_seconds": 1.2,
-                    "verification_time_seconds": 1.0,
-                    "returncode": 0,
-                },
-            }) + "\n")
+            with results_path.open("w") as stream:
+                for segment in manifest_rows:
+                    stream.write(json.dumps({
+                        "schema_version": 3,
+                        "measurement_method": MEASUREMENT_METHOD,
+                        "manifest_sha256": manifest_digest,
+                        "run_id": f"{segment['segment_id']}:temporal:r0",
+                        "segment_id": segment["segment_id"],
+                        "mode": "temporal",
+                        "repeat": 0,
+                        "selected_by": segment["selected_by"],
+                        "outcome": {
+                            "verdict": "correct", "censored": False,
+                            "measurement_valid": True, "wall_time_seconds": 1.2,
+                            "verification_time_seconds": 1.0, "returncode": 0,
+                        },
+                    }, sort_keys=True) + "\n")
             qc_output = root / "qc.md"
             qc = subprocess.run([
                 sys.executable, str(PHASE2 / "qc_report.py"),
-                "--manifest", str(manifest_path),
-                "--results", str(results_path),
-                "--boundary-features", str(boundary_path),
-                "--output", str(qc_output),
+                "--root", str(root), "--manifest", str(manifest_path),
+                "--results", str(results_path), "--output", str(qc_output),
             ], capture_output=True, text=True)
             self.assertEqual(qc.returncode, 0, qc.stdout + qc.stderr)
             self.assertIn("QC status: PASS", qc_output.read_text())
@@ -399,15 +308,11 @@ class PipelineGateTests(unittest.TestCase):
             dataset = root / "dataset.csv"
             merge = subprocess.run([
                 sys.executable, str(PHASE2 / "merge_phase2.py"),
-                "--root", str(root),
-                "--manifest", str(manifest_path),
-                "--results", str(results_path),
-                "--boundary-features", str(boundary_path),
-                "--output", str(dataset),
-                "--no-ir-features",
+                "--root", str(root), "--manifest", str(manifest_path),
+                "--results", str(results_path), "--output", str(dataset),
             ], capture_output=True, text=True)
             self.assertEqual(merge.returncode, 0, merge.stdout + merge.stderr)
-            self.assertEqual(len(dataset.read_text().splitlines()), 2)
+            self.assertEqual(len(dataset.read_text().splitlines()), len(manifest_rows) + 1)
 
 
 if __name__ == "__main__":

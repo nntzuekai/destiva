@@ -23,7 +23,10 @@ from typing import Sequence
 from phase2_common import read_jsonl
 
 
-MEASUREMENT_METHOD = "exact_snapshot_pair_v1"
+SCHEMA_VERSION = 3
+MEASUREMENT_METHOD = "live_snapshot_pair_v2"
+PROFILE_METHOD = "live_instrumented_llvm_trace_v1"
+SNAPSHOT_METHOD = "live_post_pass_ir_v1"
 TIME_RE = re.compile(
     r"PHASE2_TIME:\s+function=(\S*)\s+seconds=([0-9.eE+-]+)",
 )
@@ -43,7 +46,6 @@ def resolve_snapshot(value: object, root: Path) -> Path:
 
 
 def command_for(record: dict[str, object], args: argparse.Namespace) -> list[str]:
-    boundary = record["_boundary"]
     command = [
         str(args.alive_tv),
         "--smt-to=0",
@@ -53,8 +55,8 @@ def command_for(record: dict[str, object], args: argparse.Namespace) -> list[str
     if args.mode == "combined":
         command.append("--decompose")
     command.extend([
-        str(boundary["_start_snapshot_path"]),
-        str(boundary["_end_snapshot_path"]),
+        str(record["_start_snapshot_path"]),
+        str(record["_end_snapshot_path"]),
     ])
     return command
 
@@ -104,40 +106,33 @@ def tool_version(path: Path) -> str:
     return (result.stdout + result.stderr).strip()
 
 
-def load_exact_boundaries(
-    manifest: list[dict[str, object]], boundary_path: Path, root: Path,
-) -> tuple[dict[str, dict[str, object]], str]:
-    metadata_path = boundary_path.with_suffix(".metadata.json")
+def load_live_manifest(manifest_path: Path, root: Path) -> tuple[list[dict[str, object]], str]:
+    metadata_path = manifest_path.with_suffix(".metadata.json")
     if not metadata_path.exists():
-        raise ValueError(f"boundary metadata not found: {metadata_path}")
+        raise ValueError(f"manifest metadata not found: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 2 or not metadata.get("complete"):
-        raise ValueError(
-            f"boundary extraction is not a complete schema-v2 dataset: {metadata_path}"
-        )
-    if metadata.get("alignment_error_count") != 0 or metadata.get("errors"):
-        raise ValueError(f"boundary extraction contains alignment errors: {metadata_path}")
-    rows = read_jsonl(boundary_path)
-    boundaries: dict[str, dict[str, object]] = {}
+    if (
+        metadata.get("schema_version") != SCHEMA_VERSION
+        or metadata.get("profile_method") != PROFILE_METHOD
+        or metadata.get("snapshot_method") != SNAPSHOT_METHOD
+        or not metadata.get("complete")
+        or metadata.get("errors")
+    ):
+        raise ValueError(f"manifest is not a complete live schema-v3 collection: {metadata_path}")
+    rows = read_jsonl(manifest_path)
+    seen: set[str] = set()
+    hash_cache: dict[Path, str] = {}
     for row in rows:
         segment_id = str(row.get("segment_id", ""))
-        if not segment_id or segment_id in boundaries:
-            raise ValueError(f"duplicate or empty segment_id in {boundary_path}: {segment_id!r}")
-        boundaries[segment_id] = row
-    manifest_ids = {str(row["segment_id"]) for row in manifest}
-    if set(boundaries) != manifest_ids:
-        missing = len(manifest_ids - set(boundaries))
-        extra = len(set(boundaries) - manifest_ids)
-        raise ValueError(
-            f"boundary/manifest coverage mismatch: missing={missing}, extra={extra}"
-        )
-
-    hash_cache: dict[Path, str] = {}
-    for segment_id, row in boundaries.items():
-        if row.get("snapshot_method") != "post_pass_ir_v1":
-            raise ValueError(f"unsupported snapshot method for {segment_id}")
-        if not row.get("pass_names_match"):
-            raise ValueError(f"pass alignment is false for {segment_id}")
+        if not segment_id or segment_id in seen:
+            raise ValueError(f"duplicate or empty segment_id in {manifest_path}: {segment_id!r}")
+        seen.add(segment_id)
+        if (
+            row.get("schema_version") != SCHEMA_VERSION
+            or row.get("profile_method") != PROFILE_METHOD
+            or row.get("snapshot_method") != SNAPSHOT_METHOD
+        ):
+            raise ValueError(f"unsupported live manifest record for {segment_id}")
         for side in ("start", "end"):
             path = resolve_snapshot(row.get(f"{side}_snapshot", ""), root)
             if not path.is_file():
@@ -149,20 +144,25 @@ def load_exact_boundaries(
                     f"{side} snapshot hash mismatch for {segment_id}: {path}"
                 )
             row[f"_{side}_snapshot_path"] = path
-    return boundaries, file_sha256(boundary_path)
+    actual_digest = file_sha256(manifest_path)
+    if metadata.get("manifest_sha256") != actual_digest:
+        raise ValueError(f"manifest digest does not match metadata: {manifest_path}")
+    if metadata.get("segment_count") != len(rows):
+        raise ValueError(f"manifest record count does not match metadata: {manifest_path}")
+    return rows, actual_digest
 
 
-def validate_existing_results(path: Path, boundary_digest: str) -> set[str]:
+def validate_existing_results(path: Path, manifest_digest: str) -> set[str]:
     done: set[str] = set()
     for record in read_jsonl(path):
-        if record.get("schema_version") != 2:
+        if record.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(
                 f"legacy results cannot be resumed with the exact-snapshot runner: {path}"
             )
         if record.get("measurement_method") != MEASUREMENT_METHOD:
             raise ValueError(f"incompatible measurement method in {path}")
-        if record.get("boundary_features_sha256") != boundary_digest:
-            raise ValueError(f"results were produced from different boundary features: {path}")
+        if record.get("manifest_sha256") != manifest_digest:
+            raise ValueError(f"results were produced from a different live manifest: {path}")
         run_id = str(record.get("run_id", ""))
         if not run_id or run_id in done:
             raise ValueError(f"duplicate or empty run_id in {path}: {run_id!r}")
@@ -172,9 +172,8 @@ def validate_existing_results(path: Path, boundary_digest: str) -> set[str]:
 
 def run_one(
     record: dict[str, object], repeat: int, args: argparse.Namespace,
-    environment: dict[str, object], boundary_digest: str,
+    environment: dict[str, object], manifest_digest: str,
 ) -> dict[str, object]:
-    boundary = record["_boundary"]
     command = command_for(record, args)
     launch_command = execution_command(command, args.memory_gb)
     started = time.time()
@@ -211,9 +210,9 @@ def run_one(
     measurement_valid = outcome == "timeout" or len(function_times) == 1
     run_id = f"{record['segment_id']}:{args.mode}:r{repeat}"
     result = {
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
         "measurement_method": MEASUREMENT_METHOD,
-        "boundary_features_sha256": boundary_digest,
+        "manifest_sha256": manifest_digest,
         "run_id": run_id,
         "segment_id": record["segment_id"],
         "mode": args.mode,
@@ -225,10 +224,10 @@ def run_one(
         "end_index": record["end_index"],
         "selected_by": record["selected_by"],
         "snapshot_pair": {
-            "start": boundary["start_snapshot"],
-            "end": boundary["end_snapshot"],
-            "start_sha256": boundary["start_snapshot_sha256"],
-            "end_sha256": boundary["end_snapshot_sha256"],
+            "start": record["start_snapshot"],
+            "end": record["end_snapshot"],
+            "start_sha256": record["start_snapshot_sha256"],
+            "end_sha256": record["end_snapshot_sha256"],
         },
         "outcome": {
             "verdict": outcome,
@@ -259,7 +258,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=root)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--boundary-features", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--alive-tv", type=Path,
                         default=root / "alive2-decomp" / "build" / "alive-tv")
@@ -276,28 +274,16 @@ def main() -> None:
     args = parser.parse_args()
     args.root = args.root.resolve()
     args.manifest = args.manifest.resolve()
-    args.boundary_features = args.boundary_features.resolve()
     args.output = args.output.resolve()
     args.alive_tv = args.alive_tv.resolve()
 
-    records = read_jsonl(args.manifest)
-    if not records:
-        raise SystemExit(f"manifest is empty: {args.manifest}")
-    seen_segments = set()
-    for record in records:
-        segment = str(record["segment_id"])
-        if segment in seen_segments:
-            raise SystemExit(f"duplicate segment_id in manifest: {segment}")
-        seen_segments.add(segment)
     try:
-        boundaries, boundary_digest = load_exact_boundaries(
-            records, args.boundary_features, args.root,
-        )
-        done = validate_existing_results(args.output, boundary_digest)
+        records, manifest_digest = load_live_manifest(args.manifest, args.root)
+        if not records:
+            raise ValueError(f"manifest is empty: {args.manifest}")
+        done = validate_existing_results(args.output, manifest_digest)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    for record in records:
-        record["_boundary"] = boundaries[str(record["segment_id"])]
 
     tasks = []
     for record in records:
@@ -309,7 +295,7 @@ def main() -> None:
         tasks = tasks[:args.limit]
 
     print(f"manifest segments: {len(records)}")
-    print(f"validated exact boundary pairs: {len(boundaries)}")
+    print(f"validated exact live snapshot pairs: {len(records)}")
     print(f"already completed: {len(done)}")
     print(f"pending {args.mode} runs: {len(tasks)}")
     if not args.execute:
@@ -329,6 +315,7 @@ def main() -> None:
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "alive_tv": str(args.alive_tv),
+        "alive_tv_sha256": file_sha256(args.alive_tv),
         "alive_tv_version": tool_version(args.alive_tv),
         "timeout_seconds": args.timeout,
         "memory_gb": args.memory_gb,
@@ -339,7 +326,7 @@ def main() -> None:
     with args.output.open("a") as output, concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
             pool.submit(
-                run_one, record, repeat, args, environment, boundary_digest,
+                run_one, record, repeat, args, environment, manifest_digest,
             ): (record, repeat)
             for record, repeat in tasks
         }
@@ -348,11 +335,10 @@ def main() -> None:
             try:
                 result = future.result()
             except Exception as error:
-                boundary = record["_boundary"]
                 result = {
-                    "schema_version": 2,
+                    "schema_version": SCHEMA_VERSION,
                     "measurement_method": MEASUREMENT_METHOD,
-                    "boundary_features_sha256": boundary_digest,
+                    "manifest_sha256": manifest_digest,
                     "run_id": f"{record['segment_id']}:{args.mode}:r{repeat}",
                     "segment_id": record["segment_id"],
                     "mode": args.mode,
@@ -364,10 +350,10 @@ def main() -> None:
                     "end_index": record["end_index"],
                     "selected_by": record["selected_by"],
                     "snapshot_pair": {
-                        "start": boundary["start_snapshot"],
-                        "end": boundary["end_snapshot"],
-                        "start_sha256": boundary["start_snapshot_sha256"],
-                        "end_sha256": boundary["end_snapshot_sha256"],
+                        "start": record["start_snapshot"],
+                        "end": record["end_snapshot"],
+                        "start_sha256": record["start_snapshot_sha256"],
+                        "end_sha256": record["end_snapshot_sha256"],
                     },
                     "outcome": {
                         "verdict": "runner_error",

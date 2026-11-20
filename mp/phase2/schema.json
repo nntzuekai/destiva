@@ -1,10 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/nntzuekai/destiva/mp/phase2/schema.json",
-  "title": "DESTIVA Phase 2 segment manifest record",
+  "title": "DESTIVA Phase 2 live segment manifest record",
   "type": "object",
   "required": [
     "schema_version",
+    "profile_method",
+    "snapshot_method",
+    "profile_record_sha256",
     "segment_id",
     "benchmark",
     "function",
@@ -12,20 +15,36 @@
     "pass_count",
     "start_index",
     "end_index",
+    "start_pass",
+    "start_occurrence",
+    "end_pass",
+    "end_occurrence",
     "selected_by",
-    "features"
+    "start_snapshot",
+    "end_snapshot",
+    "start_snapshot_sha256",
+    "end_snapshot_sha256",
+    "input_features",
+    "features",
+    "boundary_features"
   ],
   "properties": {
-    "schema_version": {"const": 1},
-    "segment_id": {"type": "string"},
-    "benchmark": {"type": "string"},
-    "function": {"type": "string"},
-    "relative_ir": {"type": "string"},
-    "relative_passes": {"type": "string"},
+    "schema_version": {"const": 3},
+    "profile_method": {"const": "live_instrumented_llvm_trace_v1"},
+    "snapshot_method": {"const": "live_post_pass_ir_v1"},
+    "profile_record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "segment_id": {"type": "string", "minLength": 1},
+    "benchmark": {"type": "string", "minLength": 1},
+    "function": {"type": "string", "minLength": 1},
+    "relative_ir": {"type": "string", "pattern": "\\.ll$"},
     "pass_count": {"type": "integer", "minimum": 2},
     "start_index": {"type": "integer", "minimum": 0},
     "end_index": {"type": "integer", "minimum": 1},
     "index_pair": {"type": "string", "pattern": "^[0-9]+:[0-9]+$"},
+    "start_pass": {"type": "string"},
+    "start_occurrence": {"type": "integer", "minimum": 0},
+    "end_pass": {"type": "string"},
+    "end_occurrence": {"type": "integer", "minimum": 0},
     "selected_by": {
       "type": "array",
       "items": {
@@ -34,6 +53,11 @@
       "minItems": 1,
       "uniqueItems": true
     },
+    "start_snapshot": {"type": "string"},
+    "end_snapshot": {"type": "string"},
+    "start_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "end_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "input_features": {"type": "object"},
     "features": {
       "type": "object",
       "required": [
@@ -41,8 +65,10 @@
         "segment_diff_total",
         "segment_modified_pass_count",
         "segment_start_pass",
-        "segment_end_pass"
+        "segment_end_pass",
+        "net_diff"
       ]
-    }
+    },
+    "boundary_features": {"type": "object"}
   }
 }

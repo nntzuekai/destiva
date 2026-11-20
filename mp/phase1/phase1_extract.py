@@ -193,8 +193,9 @@ def count_function_arguments(header: str) -> int:
     return len(LOCAL_RE.findall(header[open_paren + 1:close_paren]))
 
 
-def ir_features(path: Path, function: str) -> dict[str, int | float]:
-    header, body = find_function(path.read_text(errors="replace").splitlines(), function)
+def ir_features_text(text: str, function: str) -> dict[str, int | float]:
+    """Extract function characteristics directly from textual LLVM IR."""
+    header, body = find_function(text.splitlines(), function)
     instructions = logical_instructions(body)
     opcodes = Counter(opcode for _, opcode, _ in instructions)
     n = len(instructions)
@@ -326,6 +327,11 @@ def ir_features(path: Path, function: str) -> dict[str, int | float]:
         "instructions_per_block": safe_ratio(n, block_count),
     })
     return features
+
+
+def ir_features(path: Path, function: str) -> dict[str, int | float]:
+    """Extract function characteristics from an LLVM IR file."""
+    return ir_features_text(path.read_text(errors="replace"), function)
 
 
 def pass_features(path: Path) -> dict[str, int | float | str]:

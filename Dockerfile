@@ -70,6 +70,13 @@ COPY llvm-instruction-tracking /root/destiva/llvm-instruction-tracking
 RUN cd /root/destiva/llvm-project && \
     git apply /root/destiva/llvm-instruction-tracking/0001-Instruction-tracking.patch
 
+# The upstream tracking patch logs every already-tagged instruction on every
+# callback. Phase 2 obtains identities from the IR dumps themselves, so silence
+# that redundant diagnostic stream to keep live trace collection tractable.
+COPY mp/phase2/quiet-tracking-output.patch /root/destiva/quiet-tracking-output.patch
+RUN cd /root/destiva/llvm-project && \
+    git apply /root/destiva/quiet-tracking-output.patch
+
 ARG BUILD_JOBS=16
 RUN cmake -GNinja -S /root/destiva/llvm-project/llvm -B /root/destiva/llvm-project/build \
       -DLLVM_ENABLE_RTTI=ON \
