@@ -245,9 +245,61 @@ describes the direct endpoint difference.
 
 ## Scaling after the pilot
 
-Scale in stages: finish 60 × 12, inspect the timeout and failure distributions,
-then sample several hundred functions with the same segment budget. Estimate
-the full-corpus runtime before increasing coverage or timeout. Keep concurrency,
+The first expansion targets a deterministic 300-function sampling frame with
+the same seed and 12-segment budget. The original 60 functions are the first
+balanced subset of that frame. Exclude their live profiles so this batch runs
+only the 240 new functions:
+
+```sh
+python3 mp/phase2/collect_live.py \
+  --sample-functions 300 \
+  --exclude-profiles mp/phase2/work/pilot_v3_profiles.jsonl \
+  --max-segments-per-function 12 \
+  --profiles mp/phase2/work/scale300_additional_v3_profiles.jsonl \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --snapshots-dir mp/phase2/work/scale300_additional_v3_snapshots
+```
+
+This preserves the completed pilot rather than measuring those 60 functions a
+second time. The expected additional batch is approximately 2,770 segments.
+Based on the pilot, validation should take about 21 hours with eight jobs, but
+server load and the realized timeout rate can change that estimate.
+
+Preview, collect an initial batch, and then resume without `--limit`:
+
+```sh
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --output mp/phase2/work/scale300_additional_v3_temporal_results.jsonl \
+  --jobs 8
+
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --output mp/phase2/work/scale300_additional_v3_temporal_results.jsonl \
+  --timeout 600 --memory-gb 4 --jobs 8 --limit 20 --execute
+
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --output mp/phase2/work/scale300_additional_v3_temporal_results.jsonl \
+  --timeout 600 --memory-gb 4 --jobs 8 --execute
+```
+
+Audit and merge the additional batch independently:
+
+```sh
+python3 mp/phase2/qc_report.py \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --results mp/phase2/work/scale300_additional_v3_temporal_results.jsonl \
+  --output mp/phase2/work/scale300_additional_v3_qc.md
+
+python3 mp/phase2/merge_phase2.py \
+  --manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --results mp/phase2/work/scale300_additional_v3_temporal_results.jsonl \
+  --output mp/phase2/work/scale300_additional_v3_dataset.csv
+```
+
+Keep the pilot and additional batch as separate provenance units; Phase 2
+analysis can load both CSVs and align their feature columns. Keep concurrency,
 timeout, memory limit, hardware, build type, LLVM/Z3 versions, and server load
-comparable across runs. The runner embeds the Git commit, hostname, platform,
-tool version, timeout, memory limit, and job count in every result record.
+comparable across batches. The runner embeds the Git commit, hostname,
+platform, tool version, timeout, memory limit, and job count in every result.

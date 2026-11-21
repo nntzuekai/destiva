@@ -139,6 +139,24 @@ def load_function_paths(path: Path) -> list[str]:
     return values
 
 
+def load_excluded_profiles(path: Path) -> set[str]:
+    """Load functions already collected by a compatible live profile file."""
+    excluded: set[str] = set()
+    for row in read_jsonl(path):
+        relative_ir = str(row.get("relative_ir", ""))
+        if (
+            row.get("schema_version") != SCHEMA_VERSION
+            or row.get("profile_method") != PROFILE_METHOD
+            or not relative_ir
+            or relative_ir in excluded
+        ):
+            raise ValueError(f"invalid or duplicate live profile in {path}: {relative_ir!r}")
+        excluded.add(relative_ir)
+    if not excluded:
+        raise ValueError(f"exclusion profile file is empty: {path}")
+    return excluded
+
+
 def sample_functions(paths: list[str], count: int, seed: int) -> list[str]:
     if count <= 0 or count >= len(paths):
         return sorted(paths)
@@ -352,6 +370,10 @@ def main() -> None:
     parser.add_argument("--snapshots-dir", type=Path, required=True)
     parser.add_argument("--opt", type=Path, default=root / "llvm-project" / "build" / "bin" / "opt")
     parser.add_argument("--sample-functions", type=int, default=60)
+    parser.add_argument(
+        "--exclude-profiles", type=Path,
+        help="live profile JSONL whose functions should be omitted from this batch",
+    )
     parser.add_argument("--limit-functions", type=int, default=0)
     parser.add_argument("--max-segments-per-function", type=int, default=12)
     parser.add_argument("--heuristics", nargs="+", choices=HEURISTICS, default=list(DEFAULT_HEURISTICS))
@@ -363,10 +385,23 @@ def main() -> None:
         raise SystemExit("--resume and --overwrite are mutually exclusive")
     for name in ("root", "functions", "profiles", "manifest", "snapshots_dir", "opt"):
         setattr(args, name, getattr(args, name).resolve())
+    if args.exclude_profiles is not None:
+        args.exclude_profiles = args.exclude_profiles.resolve()
     if not args.opt.is_file():
         raise SystemExit(f"LLVM opt not found: {args.opt}")
 
-    paths = sample_functions(load_function_paths(args.functions), args.sample_functions, args.seed)
+    sampling_frame = sample_functions(
+        load_function_paths(args.functions), args.sample_functions, args.seed,
+    )
+    try:
+        excluded = (
+            load_excluded_profiles(args.exclude_profiles)
+            if args.exclude_profiles is not None else set()
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    excluded_in_frame = set(sampling_frame) & excluded
+    paths = [path for path in sampling_frame if path not in excluded]
     if args.limit_functions > 0:
         paths = paths[:args.limit_functions]
     args.profiles.parent.mkdir(parents=True, exist_ok=True)
@@ -560,6 +595,12 @@ def main() -> None:
         "requested_functions": len(paths),
         "completed_functions": len(set(paths) & set(profile_by_ir)),
         "sample_functions": args.sample_functions,
+        "sampling_frame_functions": len(sampling_frame),
+        "exclude_profiles": str(args.exclude_profiles) if args.exclude_profiles else None,
+        "exclude_profiles_sha256": (
+            file_sha256(args.exclude_profiles) if args.exclude_profiles else None
+        ),
+        "excluded_functions": len(excluded_in_frame),
         "max_segments_per_function": args.max_segments_per_function,
         "heuristics": list(args.heuristics),
         "seed": args.seed,

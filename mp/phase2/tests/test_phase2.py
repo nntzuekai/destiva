@@ -22,6 +22,7 @@ from collect_live import (
     change_summary,
     discover_function_name,
     flatten_boundary_features,
+    load_excluded_profiles,
     pair_sections,
     parse_sections,
 )
@@ -160,6 +161,16 @@ class HeuristicTests(unittest.TestCase):
 
 
 class LiveCollectorTests(unittest.TestCase):
+    def test_loads_only_compatible_profiles_for_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.jsonl"
+            path.write_text(json.dumps({
+                "schema_version": 3,
+                "profile_method": "live_instrumented_llvm_trace_v1",
+                "relative_ir": "demo/sample.ll",
+            }) + "\n")
+            self.assertEqual(load_excluded_profiles(path), {"demo/sample.ll"})
+
     def test_discovers_single_definition_when_filename_has_a_prefix(self) -> None:
         text = "define void @fiat_p256_add(ptr %out) {\n  ret void\n}\n"
         self.assertEqual(
