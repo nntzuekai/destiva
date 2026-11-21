@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 import tester
 from collect_live import (
     change_summary,
+    discover_function_name,
     flatten_boundary_features,
     pair_sections,
     parse_sections,
@@ -159,6 +160,13 @@ class HeuristicTests(unittest.TestCase):
 
 
 class LiveCollectorTests(unittest.TestCase):
+    def test_discovers_single_definition_when_filename_has_a_prefix(self) -> None:
+        text = "define void @fiat_p256_add(ptr %out) {\n  ret void\n}\n"
+        self.assertEqual(
+            discover_function_name(text, "p256_32_fiat_p256_add"),
+            "fiat_p256_add",
+        )
+
     def test_dump_pairing_and_instruction_characteristics(self) -> None:
         pairs = pair_sections(parse_sections(fake_dump()))
         self.assertEqual([pair[0] for pair in pairs], ["FirstPass", "SecondPass", "ThirdPass"])
@@ -174,6 +182,21 @@ class LiveCollectorTests(unittest.TestCase):
             {"ir_instruction_count": 2}, {"ir_instruction_count": 3},
         )
         self.assertEqual(features["delta_ir_instruction_count"], 1)
+
+    def test_cloned_metadata_id_is_counted_as_an_added_instruction(self) -> None:
+        before = ir(1)
+        after = before.replace(
+            "  ret i32 %x, !mymd !1",
+            "  %y = mul i32 %x, 2, !mymd !0\n  ret i32 %x, !mymd !1",
+        )
+        sys.path.insert(0, str(ROOT / "mp" / "phase1"))
+        from phase1_extract import find_function, logical_instructions
+        changes = change_summary(
+            before, after, "sample", find_function, logical_instructions,
+        )
+        self.assertEqual(changes["added_count"], 1)
+        self.assertEqual(changes["modified_count"], 0)
+        self.assertEqual(changes["features"]["added_opcode_mul_count"], 1)
 
     def test_collector_needs_no_pass_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

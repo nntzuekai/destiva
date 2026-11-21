@@ -164,6 +164,25 @@ def sample_functions(paths: list[str], count: int, seed: int) -> list[str]:
     return selected
 
 
+def discover_function_name(ir_text: str, preferred: str) -> str:
+    """Return the defined function, allowing prepared filenames to add prefixes."""
+    definitions: list[str] = []
+    for line in ir_text.splitlines():
+        if not line.lstrip().startswith("define "):
+            continue
+        match = GLOBAL_RE.search(line)
+        if match:
+            token = match.group(0)[1:]
+            definitions.append(token[1:-1] if token.startswith('"') else token)
+    if preferred in definitions:
+        return preferred
+    if len(definitions) == 1:
+        return definitions[0]
+    raise ValueError(
+        f"cannot identify function for {preferred!r}; definitions={definitions!r}"
+    )
+
+
 def metadata_ids(ir_text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in ir_text.splitlines():
@@ -173,13 +192,13 @@ def metadata_ids(ir_text: str) -> dict[str, str]:
     return result
 
 
-def tracked_instruction_map(
+def tracked_instruction_groups(
     ir_text: str, function: str, find_function, logical_instructions,
-) -> dict[str, tuple[str, str]]:
-    """Map stable ``!mymd`` IDs to (opcode, canonical instruction text)."""
+) -> dict[str, list[tuple[str, str]]]:
+    """Group instructions by ``!mymd`` ID, including IDs copied by cloning."""
     md_ids = metadata_ids(ir_text)
     _, body = find_function(ir_text.splitlines(), function)
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, list[tuple[str, str]]] = defaultdict(list)
     untracked = 0
     for value, opcode, rhs in logical_instructions(body):
         text = f"{value} = {rhs}" if value else rhs
@@ -188,9 +207,9 @@ def tracked_instruction_map(
             untracked += 1
             continue
         stable_id = md_ids[attachment.group(1)]
-        if stable_id in result:
-            raise ValueError(f"duplicate !mymd instruction ID {stable_id} in @{function}")
-        result[stable_id] = (opcode, TRAILING_METADATA_RE.sub("", text).strip())
+        result[stable_id].append(
+            (opcode, TRAILING_METADATA_RE.sub("", text).strip())
+        )
     if untracked:
         raise ValueError(f"{untracked} instructions in @{function} lack resolvable !mymd IDs")
     return result
@@ -236,31 +255,51 @@ def summarize_instructions(records: Iterable[tuple[str, str]]) -> dict[str, int]
 def change_summary(
     before: str, after: str, function: str, find_function, logical_instructions,
 ) -> dict[str, object]:
-    pre = tracked_instruction_map(before, function, find_function, logical_instructions)
-    post = tracked_instruction_map(after, function, find_function, logical_instructions)
-    pre_ids, post_ids = set(pre), set(post)
-    removed = pre_ids - post_ids
-    added = post_ids - pre_ids
-    modified = {key for key in pre_ids & post_ids if pre[key][1] != post[key][1]}
+    pre = tracked_instruction_groups(before, function, find_function, logical_instructions)
+    post = tracked_instruction_groups(after, function, find_function, logical_instructions)
+    removed: list[tuple[str, str]] = []
+    added: list[tuple[str, str]] = []
+    modified_pre: list[tuple[str, str]] = []
+    modified_post: list[tuple[str, str]] = []
+    for stable_id in sorted(set(pre) | set(post)):
+        pre_remaining = list(pre.get(stable_id, []))
+        post_remaining = list(post.get(stable_id, []))
+
+        # LLVM cloning may copy arbitrary metadata. Match text-identical copies
+        # first, then treat the remaining one-to-one pairs as modifications.
+        unmatched_pre: list[tuple[str, str]] = []
+        for record in pre_remaining:
+            try:
+                match = post_remaining.index(record)
+            except ValueError:
+                unmatched_pre.append(record)
+            else:
+                post_remaining.pop(match)
+        pair_count = min(len(unmatched_pre), len(post_remaining))
+        modified_pre.extend(unmatched_pre[:pair_count])
+        modified_post.extend(post_remaining[:pair_count])
+        removed.extend(unmatched_pre[pair_count:])
+        added.extend(post_remaining[pair_count:])
+
     groups = {
-        "removed": (pre[key] for key in removed),
-        "added": (post[key] for key in added),
-        "modified_pre": (pre[key] for key in modified),
-        "modified_post": (post[key] for key in modified),
-        "touched_pre": (pre[key] for key in removed | modified),
-        "touched_post": (post[key] for key in added | modified),
+        "removed": removed,
+        "added": added,
+        "modified_pre": modified_pre,
+        "modified_post": modified_post,
+        "touched_pre": removed + modified_pre,
+        "touched_post": added + modified_post,
     }
     features: dict[str, int] = {}
     for prefix, records in groups.items():
         for key, value in summarize_instructions(records).items():
             features[f"{prefix}_{key}"] = value
     return {
-        "before_instruction_count": len(pre),
-        "after_instruction_count": len(post),
+        "before_instruction_count": sum(len(records) for records in pre.values()),
+        "after_instruction_count": sum(len(records) for records in post.values()),
         "removed_count": len(removed),
         "added_count": len(added),
-        "modified_count": len(modified),
-        "diff": len(removed) + len(added) + len(modified),
+        "modified_count": len(modified_pre),
+        "diff": len(removed) + len(added) + len(modified_pre),
         "features": features,
     }
 
@@ -374,7 +413,13 @@ def main() -> None:
         if not ir_path.is_file():
             errors.append({"relative_ir": relative_ir, "error": "IR file not found"})
             continue
-        function = ir_path.stem
+        try:
+            function = discover_function_name(
+                ir_path.read_text(errors="replace"), ir_path.stem,
+            )
+        except ValueError as error:
+            errors.append({"relative_ir": relative_ir, "error": str(error)})
+            continue
         command = [
             str(args.opt), "-passes=default<O3>", "--print-before-all",
             "--print-after-all", "--print-module-scope", "-disable-output", str(ir_path),
