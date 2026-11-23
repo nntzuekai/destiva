@@ -157,6 +157,95 @@ def load_excluded_profiles(path: Path) -> set[str]:
     return excluded
 
 
+def profile_trace_identity(profile: dict[str, object]) -> str:
+    """Identify the pass order and change data that define segment indices."""
+    trace = {
+        "function": profile.get("function"),
+        "pipeline": profile.get("pipeline"),
+        "pass_count": profile.get("pass_count"),
+        "pass_sequence_sha256": profile.get("pass_sequence_sha256"),
+        "passes": profile.get("passes"),
+    }
+    return text_sha256(json.dumps(trace, sort_keys=True))
+
+
+def load_excluded_segments(
+    paths: list[Path],
+) -> tuple[set[tuple[str, int, int]], dict[str, str]]:
+    """Load exact live segments and their pass-trace identities.
+
+    Excluding a numeric index pair is safe only when the current trace has the
+    same pass sequence and change data as the earlier trace.
+    """
+    excluded: set[tuple[str, int, int]] = set()
+    trace_identities: dict[str, str] = {}
+    for path in paths:
+        metadata_path = path.with_suffix(".metadata.json")
+        if not path.is_file() or not metadata_path.is_file():
+            raise ValueError(f"exclusion manifest or metadata not found: {path}")
+        metadata = json.loads(metadata_path.read_text())
+        if (
+            metadata.get("schema_version") != SCHEMA_VERSION
+            or not metadata.get("complete")
+            or metadata.get("profile_method") != PROFILE_METHOD
+            or metadata.get("snapshot_method") != SNAPSHOT_METHOD
+            or metadata.get("manifest_sha256") != file_sha256(path)
+        ):
+            raise ValueError(f"incomplete or incompatible exclusion manifest: {path}")
+
+        recorded_profiles = Path(str(metadata.get("profiles", "")))
+        profile_path = recorded_profiles
+        if not profile_path.is_file():
+            profile_path = path.parent / recorded_profiles.name
+        if (
+            not profile_path.is_file()
+            or metadata.get("profiles_sha256") != file_sha256(profile_path)
+        ):
+            raise ValueError(f"profiles for exclusion manifest are unavailable or modified: {path}")
+
+        profiles: dict[str, tuple[str, str]] = {}
+        for row in read_jsonl(profile_path):
+            relative_ir = str(row.get("relative_ir", ""))
+            sequence = str(row.get("pass_sequence_sha256", ""))
+            if (
+                row.get("schema_version") != SCHEMA_VERSION
+                or row.get("profile_method") != PROFILE_METHOD
+                or not relative_ir
+                or not sequence
+                or relative_ir in profiles
+            ):
+                raise ValueError(f"invalid live profile in {profile_path}: {relative_ir!r}")
+            digest = text_sha256(json.dumps(row, sort_keys=True) + "\n")
+            profiles[relative_ir] = (profile_trace_identity(row), digest)
+
+        for row in read_jsonl(path):
+            relative_ir = str(row.get("relative_ir", ""))
+            try:
+                start = int(row["start_index"])
+                end = int(row["end_index"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"invalid segment indices in {path}") from error
+            if (
+                row.get("schema_version") != SCHEMA_VERSION
+                or row.get("profile_method") != PROFILE_METHOD
+                or row.get("snapshot_method") != SNAPSHOT_METHOD
+                or relative_ir not in profiles
+                or not (0 <= start < end)
+                or row.get("segment_id") != segment_id(relative_ir, start, end)
+                or row.get("profile_record_sha256") != profiles[relative_ir][1]
+            ):
+                raise ValueError(
+                    f"invalid live segment in exclusion manifest {path}: "
+                    f"{relative_ir}:{start}:{end}"
+                )
+            trace_identity = profiles[relative_ir][0]
+            previous = trace_identities.setdefault(relative_ir, trace_identity)
+            if previous != trace_identity:
+                raise ValueError(f"exclusion manifests disagree on live trace: {relative_ir}")
+            excluded.add((relative_ir, start, end))
+    return excluded, trace_identities
+
+
 def sample_functions(paths: list[str], count: int, seed: int) -> list[str]:
     if count <= 0 or count >= len(paths):
         return sorted(paths)
@@ -374,6 +463,10 @@ def main() -> None:
         "--exclude-profiles", type=Path,
         help="live profile JSONL whose functions should be omitted from this batch",
     )
+    parser.add_argument(
+        "--exclude-manifest", type=Path, action="append", default=[],
+        help="complete live manifest whose exact segment pairs should be omitted; repeatable",
+    )
     parser.add_argument("--limit-functions", type=int, default=0)
     parser.add_argument("--max-segments-per-function", type=int, default=12)
     parser.add_argument("--heuristics", nargs="+", choices=HEURISTICS, default=list(DEFAULT_HEURISTICS))
@@ -387,6 +480,7 @@ def main() -> None:
         setattr(args, name, getattr(args, name).resolve())
     if args.exclude_profiles is not None:
         args.exclude_profiles = args.exclude_profiles.resolve()
+    args.exclude_manifest = [path.resolve() for path in args.exclude_manifest]
     if not args.opt.is_file():
         raise SystemExit(f"LLVM opt not found: {args.opt}")
 
@@ -399,6 +493,12 @@ def main() -> None:
             if args.exclude_profiles is not None else set()
         )
     except ValueError as error:
+        raise SystemExit(str(error)) from error
+    try:
+        excluded_segments, excluded_trace_identities = load_excluded_segments(
+            args.exclude_manifest,
+        )
+    except (ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
     excluded_in_frame = set(sampling_frame) & excluded
     paths = [path for path in sampling_frame if path not in excluded]
@@ -436,8 +536,20 @@ def main() -> None:
             raise SystemExit(f"invalid or duplicate live segment {segment!r}")
         seen_segments.add(segment)
         manifest_by_ir[str(row["relative_ir"])].append(row)
-    if set(profile_by_ir) != set(manifest_by_ir):
-        raise SystemExit("resume files disagree on completed functions")
+    extra_manifest_functions = set(manifest_by_ir) - set(profile_by_ir)
+    if extra_manifest_functions:
+        raise SystemExit("resume manifest contains functions absent from profiles")
+    for relative_ir, profile in profile_by_ir.items():
+        rows = manifest_by_ir.get(relative_ir, [])
+        expected = profile.get("selected_segment_count")
+        if expected is None and not rows:
+            raise SystemExit("resume files disagree on completed functions")
+        if expected is not None and len(rows) != int(expected):
+            raise SystemExit(
+                f"resume segment count mismatch for {relative_ir}: "
+                f"expected {expected}, found {len(rows)}"
+            )
+        manifest_by_ir.setdefault(relative_ir, [])
 
     errors: list[dict[str, object]] = []
     for number, relative_ir in enumerate(paths, 1):
@@ -489,12 +601,33 @@ def main() -> None:
                     "change_features": changes["features"],
                 })
 
-            candidates = collect_candidates(passes, args.heuristics)
+            pass_sequence_digest = text_sha256(
+                "\0".join(str(row["name"]) for row in passes)
+            )
+            current_trace_identity = profile_trace_identity({
+                "function": function,
+                "pipeline": "default<O3>",
+                "pass_count": len(passes),
+                "pass_sequence_sha256": pass_sequence_digest,
+                "passes": passes,
+            })
+            excluded_trace_identity = excluded_trace_identities.get(relative_ir)
+            if (
+                excluded_trace_identity is not None
+                and excluded_trace_identity != current_trace_identity
+            ):
+                raise ValueError(
+                    "live pass trace differs from exclusion manifest; "
+                    "segment indices cannot be safely excluded"
+                )
+            candidates = {
+                pair: selected_by
+                for pair, selected_by in collect_candidates(passes, args.heuristics).items()
+                if (relative_ir, pair[0], pair[1]) not in excluded_segments
+            }
             chosen = sorted(select_candidates(
                 candidates, args.max_segments_per_function, args.seed, relative_ir,
             ))
-            if not chosen:
-                raise ValueError("live pipeline yielded no candidate segments")
             endpoint_indices = sorted({value for pair in chosen for value in pair})
             snapshot_data: dict[int, tuple[str, str]] = {}
             state_features: dict[int, dict[str, int | float]] = {}
@@ -515,7 +648,8 @@ def main() -> None:
                 "pipeline": "default<O3>",
                 "pass_count": len(passes),
                 "input_features": input_features,
-                "pass_sequence_sha256": text_sha256("\0".join(str(row["name"]) for row in passes)),
+                "pass_sequence_sha256": pass_sequence_digest,
+                "selected_segment_count": len(chosen),
                 "passes": passes,
             }
             profile_json = json.dumps(profile, sort_keys=True)
@@ -601,6 +735,9 @@ def main() -> None:
             file_sha256(args.exclude_profiles) if args.exclude_profiles else None
         ),
         "excluded_functions": len(excluded_in_frame),
+        "exclude_manifests": [str(path) for path in args.exclude_manifest],
+        "exclude_manifest_sha256": [file_sha256(path) for path in args.exclude_manifest],
+        "excluded_segment_count": len(excluded_segments),
         "max_segments_per_function": args.max_segments_per_function,
         "heuristics": list(args.heuristics),
         "seed": args.seed,

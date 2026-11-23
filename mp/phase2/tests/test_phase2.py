@@ -23,6 +23,7 @@ from collect_live import (
     discover_function_name,
     flatten_boundary_features,
     load_excluded_profiles,
+    load_excluded_segments,
     pair_sections,
     parse_sections,
 )
@@ -170,6 +171,47 @@ class LiveCollectorTests(unittest.TestCase):
                 "relative_ir": "demo/sample.ll",
             }) + "\n")
             self.assertEqual(load_excluded_profiles(path), {"demo/sample.ll"})
+
+    def test_excludes_exact_segments_from_complete_live_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, manifest = run_collector(root)
+            rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+            excluded, sequences = load_excluded_segments([manifest])
+            self.assertEqual(
+                excluded,
+                {(row["relative_ir"], row["start_index"], row["end_index"])
+                 for row in rows},
+            )
+            self.assertEqual(set(sequences), {"demo/sample.ll"})
+
+    def test_completion_collection_allows_zero_remaining_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, existing_manifest = run_collector(root)
+            profiles = root / "work" / "completion_profiles.jsonl"
+            manifest = root / "work" / "completion_manifest.jsonl"
+            run = subprocess.run([
+                sys.executable, str(PHASE2 / "collect_live.py"),
+                "--root", str(root),
+                "--functions", str(root / "functions.txt"),
+                "--opt", str(root / "opt"),
+                "--sample-functions", "0",
+                "--max-segments-per-function", "0",
+                "--heuristics", "mean", "median", "top2", "fixed",
+                "dynamic_four", "dynamic",
+                "--exclude-manifest", str(existing_manifest),
+                "--profiles", str(profiles),
+                "--manifest", str(manifest),
+                "--snapshots-dir", str(root / "work" / "completion_snapshots"),
+            ], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            profile = json.loads(profiles.read_text())
+            metadata = json.loads(manifest.with_suffix(".metadata.json").read_text())
+            self.assertEqual(profile["selected_segment_count"], 0)
+            self.assertEqual(manifest.read_text(), "")
+            self.assertTrue(metadata["complete"])
+            self.assertEqual(metadata["segment_count"], 0)
 
     def test_discovers_single_definition_when_filename_has_a_prefix(self) -> None:
         text = "define void @fiat_p256_add(ptr %out) {\n  ret void\n}\n"
