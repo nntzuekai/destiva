@@ -48,11 +48,21 @@
     "selected_by": {
       "type": "array",
       "items": {
-        "enum": ["end_to_end", "all_passes", "mean", "median", "top2", "fixed", "dynamic_four", "dynamic"]
+        "enum": ["end_to_end", "all_passes", "mean", "median", "top2", "fixed", "dynamic_four", "dynamic", "nonheuristic_augmentation"]
       },
       "minItems": 1,
       "uniqueItems": true
     },
+    "selection_policy": {
+      "enum": ["heuristic", "nonheuristic_augmentation_v1"]
+    },
+    "sampling_stratum": {
+      "enum": ["adjacent_early", "adjacent_middle", "adjacent_late", "multipass_short", "multipass_medium", "multipass_long"]
+    },
+    "sampling_diff_tertile": {
+      "enum": ["low", "middle", "high"]
+    },
+    "sampling_stratum_candidate_count": {"type": "integer", "minimum": 1},
     "start_snapshot": {"type": "string"},
     "end_snapshot": {"type": "string"},
     "start_snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

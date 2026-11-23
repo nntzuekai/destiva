@@ -32,6 +32,22 @@ DEFAULT_HEURISTICS = (
     "dynamic_four",
     "dynamic",
 )
+DESTIVA_CUTPOINT_HEURISTICS = (
+    "mean",
+    "median",
+    "top2",
+    "fixed",
+    "dynamic_four",
+    "dynamic",
+)
+AUGMENTATION_STRATA = (
+    "adjacent_early",
+    "adjacent_middle",
+    "adjacent_late",
+    "multipass_short",
+    "multipass_medium",
+    "multipass_long",
+)
 
 
 def load_passes(path: Path) -> tuple[str, list[dict[str, object]]]:
@@ -152,6 +168,81 @@ def stable_order_key(seed: int, scope: str, value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def nonheuristic_augmentation_segments(
+    passes: Sequence[Mapping[str, object]],
+    excluded: Iterable[tuple[int, int]],
+    seed: int,
+    scope: str,
+) -> dict[tuple[int, int], dict[str, object]]:
+    """Select six diverse pairs outside the complete DESTIVA heuristic union."""
+    n = len(passes)
+    if n < 2:
+        return {}
+    forbidden = set(excluded)
+    forbidden.update(collect_candidates(passes, DESTIVA_CUTPOINT_HEURISTICS))
+    forbidden.add((0, n - 1))  # undecomposed end-to-end baseline
+
+    strata: dict[str, list[tuple[int, int]]] = {
+        name: [] for name in AUGMENTATION_STRATA
+    }
+    for start in range(n - 1):
+        for end in range(start + 1, n):
+            pair = (start, end)
+            if pair in forbidden:
+                continue
+            span = end - start
+            if span == 1:
+                region = min(2, (3 * start) // max(1, n - 1))
+                stratum = AUGMENTATION_STRATA[region]
+            elif span <= 10:
+                stratum = "multipass_short"
+            elif span <= 40:
+                stratum = "multipass_medium"
+            else:
+                stratum = "multipass_long"
+            strata[stratum].append(pair)
+
+    prefix = [0]
+    for entry in passes:
+        prefix.append(prefix[-1] + int(entry["diff"]))
+
+    selected: dict[tuple[int, int], dict[str, object]] = {}
+    tertile_names = ("low", "middle", "high")
+    for stratum in AUGMENTATION_STRATA:
+        candidates = strata[stratum]
+        if not candidates:
+            raise ValueError(f"no eligible non-heuristic candidates in {stratum}")
+
+        def diff_total(pair: tuple[int, int]) -> int:
+            start, end = pair
+            return prefix[end + 1] - prefix[start + 1]
+
+        ranked = sorted(
+            candidates,
+            key=lambda pair: (
+                diff_total(pair), stable_order_key(seed, f"{scope}:{stratum}:rank", pair),
+            ),
+        )
+        buckets: list[list[tuple[int, int]]] = [[], [], []]
+        for index, pair in enumerate(ranked):
+            bucket = min(2, (3 * index) // len(ranked))
+            buckets[bucket].append(pair)
+        available = [index for index, values in enumerate(buckets) if values]
+        selector = int(stable_order_key(seed, scope, f"{stratum}:tertile")[:16], 16)
+        tertile = available[selector % len(available)]
+        chosen = min(
+            buckets[tertile],
+            key=lambda pair: stable_order_key(seed, f"{scope}:{stratum}:choose", pair),
+        )
+        selected[chosen] = {
+            "selection_policy": "nonheuristic_augmentation_v1",
+            "sampling_stratum": stratum,
+            "sampling_diff_tertile": tertile_names[tertile],
+            "sampling_stratum_candidate_count": len(candidates),
+        }
+    return selected
+
+
 def select_candidates(
     candidates: Mapping[tuple[int, int], set[str]],
     max_segments: int,
@@ -257,4 +348,3 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
                 except json.JSONDecodeError as error:
                     raise ValueError(f"{path}:{number}: {error}") from error
     return records
-

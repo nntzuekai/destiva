@@ -73,6 +73,12 @@ def main() -> None:
             "end_occurrence": segment["end_occurrence"],
             "pass_count": segment["pass_count"],
             "selected_by": ";".join(segment["selected_by"]),
+            "selection_policy": segment.get("selection_policy", "heuristic"),
+            "sampling_stratum": segment.get("sampling_stratum", ""),
+            "sampling_diff_tertile": segment.get("sampling_diff_tertile", ""),
+            "sampling_stratum_candidate_count": segment.get(
+                "sampling_stratum_candidate_count", "",
+            ),
             "verdict": outcome.get("verdict", ""),
             "censored": outcome.get("censored", ""),
             "measurement_valid": outcome.get("measurement_valid", ""),
@@ -89,6 +95,8 @@ def main() -> None:
         "schema_version", "run_id", "segment_id", "measurement_method", "mode", "repeat",
         "benchmark", "function", "relative_ir", "start_index", "end_index", "start_pass",
         "start_occurrence", "end_pass", "end_occurrence", "pass_count", "selected_by",
+        "selection_policy", "sampling_stratum", "sampling_diff_tertile",
+        "sampling_stratum_candidate_count",
         "verdict", "censored", "measurement_valid", "wall_time_seconds",
         "verification_time_seconds", "returncode",
     ]

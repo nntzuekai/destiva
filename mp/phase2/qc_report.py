@@ -133,7 +133,7 @@ def main() -> None:
         *table(["Verdict", "Runs"], [[key, value] for key, value in sorted(verdicts.items())]), "",
         "## Manifest coverage by benchmark", "",
         *table(["Benchmark", "Segments"], [[key, value] for key, value in sorted(benchmarks.items())]), "",
-        "## Heuristic membership", "",
+        "## Selection membership", "",
         *table(
             ["Heuristic", "Manifest segments", "Collected records"],
             [[key, heuristic_manifest[key], heuristic_results[key]]

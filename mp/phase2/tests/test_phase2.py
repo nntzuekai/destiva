@@ -28,8 +28,11 @@ from collect_live import (
     parse_sections,
 )
 from phase2_common import (
+    AUGMENTATION_STRATA,
+    DESTIVA_CUTPOINT_HEURISTICS,
     collect_candidates,
     heuristic_segments,
+    nonheuristic_augmentation_segments,
     segment_features,
     select_candidates,
 )
@@ -159,6 +162,33 @@ class HeuristicTests(unittest.TestCase):
         first = select_candidates(candidates, 5, 7, "sample")
         self.assertEqual(first, select_candidates(candidates, 5, 7, "sample"))
         self.assertTrue(set(heuristic_segments(passes, "dynamic_four")).issubset(first))
+
+    def test_augmentation_is_outside_full_heuristic_union(self) -> None:
+        passes = [
+            {
+                "index": index,
+                "name": f"Pass{index}",
+                "occurrence": 0,
+                "diff": (index * 7) % 17,
+            }
+            for index in range(111)
+        ]
+        heuristic_union = set(collect_candidates(passes, DESTIVA_CUTPOINT_HEURISTICS))
+        first = nonheuristic_augmentation_segments(passes, set(), 19, "demo/sample.ll")
+        self.assertEqual(first, nonheuristic_augmentation_segments(
+            passes, set(), 19, "demo/sample.ll",
+        ))
+        self.assertEqual(len(first), 6)
+        self.assertEqual(
+            {details["sampling_stratum"] for details in first.values()},
+            set(AUGMENTATION_STRATA),
+        )
+        self.assertFalse(set(first) & heuristic_union)
+        self.assertNotIn((0, len(passes) - 1), first)
+        second = nonheuristic_augmentation_segments(
+            passes, {next(iter(first))}, 19, "demo/sample.ll",
+        )
+        self.assertFalse(set(second) & {next(iter(first))})
 
 
 class LiveCollectorTests(unittest.TestCase):

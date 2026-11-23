@@ -366,3 +366,72 @@ python3 mp/phase2/merge_phase2.py \
   --results mp/phase2/work/heuristic_completion_v3_temporal_results.jsonl \
   --output mp/phase2/work/heuristic_completion_v3_dataset.csv
 ```
+
+## Collect the non-heuristic augmentation cohort
+
+After completing the six DESTIVA cut-point heuristics, sample a separate
+control cohort containing only intervals that none of those heuristics select.
+The sampler also excludes the end-to-end baseline and every pair in the pilot,
+scale-300, and heuristic-completion manifests.
+
+It selects six intervals per function:
+
+- one adjacent interval from each of the early, middle, and late pipeline
+  regions; and
+- one multi-pass interval from each of the short (2–10 passes), medium (11–40),
+  and long (41 or more) span strata.
+
+Within each stratum, functions are distributed across low, middle, and high
+modified-instruction-total tertiles using the fixed experiment seed. Selection
+uses no validation result or solver statistic. The resulting manifest records
+the structural stratum, change-load tertile, and eligible candidate count.
+
+```sh
+python3 mp/phase2/collect_live.py \
+  --sample-functions 300 \
+  --sampling-policy nonheuristic_augmentation \
+  --exclude-manifest mp/phase2/work/pilot_v3_manifest.jsonl \
+  --exclude-manifest mp/phase2/work/scale300_additional_v3_manifest.jsonl \
+  --exclude-manifest mp/phase2/work/heuristic_completion_v3_manifest.jsonl \
+  --profiles mp/phase2/work/nonheuristic_augmentation_v3_profiles.jsonl \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --snapshots-dir mp/phase2/work/nonheuristic_augmentation_v3_snapshots
+```
+
+For the current 300 functions this must produce exactly 1,800 segments: six
+from every function, with 300 records in each sampling stratum. A different
+count means collection should stop before validation.
+
+Preview, measure an initial 20, and then resume the full manifest in its stored
+order. Do not request repeated measurements.
+
+```sh
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --output mp/phase2/work/nonheuristic_augmentation_v3_temporal_results.jsonl \
+  --jobs 8
+
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --output mp/phase2/work/nonheuristic_augmentation_v3_temporal_results.jsonl \
+  --timeout 600 --memory-gb 4 --jobs 8 --limit 20 --execute
+
+python3 mp/phase2/run_segments.py \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --output mp/phase2/work/nonheuristic_augmentation_v3_temporal_results.jsonl \
+  --timeout 600 --memory-gb 4 --jobs 8 --execute
+```
+
+Audit and merge this cohort independently:
+
+```sh
+python3 mp/phase2/qc_report.py \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --results mp/phase2/work/nonheuristic_augmentation_v3_temporal_results.jsonl \
+  --output mp/phase2/work/nonheuristic_augmentation_v3_qc.md
+
+python3 mp/phase2/merge_phase2.py \
+  --manifest mp/phase2/work/nonheuristic_augmentation_v3_manifest.jsonl \
+  --results mp/phase2/work/nonheuristic_augmentation_v3_temporal_results.jsonl \
+  --output mp/phase2/work/nonheuristic_augmentation_v3_dataset.csv
+```

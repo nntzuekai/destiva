@@ -22,8 +22,10 @@ from typing import Iterable
 
 from phase2_common import (
     DEFAULT_HEURISTICS,
+    DESTIVA_CUTPOINT_HEURISTICS,
     HEURISTICS,
     collect_candidates,
+    nonheuristic_augmentation_segments,
     read_jsonl,
     segment_features,
     segment_id,
@@ -470,6 +472,12 @@ def main() -> None:
     parser.add_argument("--limit-functions", type=int, default=0)
     parser.add_argument("--max-segments-per-function", type=int, default=12)
     parser.add_argument("--heuristics", nargs="+", choices=HEURISTICS, default=list(DEFAULT_HEURISTICS))
+    parser.add_argument(
+        "--sampling-policy",
+        choices=("heuristic", "nonheuristic_augmentation"),
+        default="heuristic",
+        help="candidate-generation policy; augmentation always selects six non-heuristic strata",
+    )
     parser.add_argument("--seed", type=int, default=20261119)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -500,6 +508,16 @@ def main() -> None:
         )
     except (ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
+    if args.sampling_policy == "nonheuristic_augmentation" and not args.exclude_manifest:
+        raise SystemExit(
+            "nonheuristic augmentation requires the existing cohort manifests "
+            "via --exclude-manifest"
+        )
+    effective_sampling_policy = (
+        "nonheuristic_augmentation_v1"
+        if args.sampling_policy == "nonheuristic_augmentation"
+        else "heuristic"
+    )
     excluded_in_frame = set(sampling_frame) & excluded
     paths = [path for path in sampling_frame if path not in excluded]
     if args.limit_functions > 0:
@@ -620,14 +638,30 @@ def main() -> None:
                     "live pass trace differs from exclusion manifest; "
                     "segment indices cannot be safely excluded"
                 )
-            candidates = {
-                pair: selected_by
-                for pair, selected_by in collect_candidates(passes, args.heuristics).items()
-                if (relative_ir, pair[0], pair[1]) not in excluded_segments
-            }
-            chosen = sorted(select_candidates(
-                candidates, args.max_segments_per_function, args.seed, relative_ir,
-            ))
+            if args.sampling_policy == "nonheuristic_augmentation":
+                local_excluded = {
+                    (start, end)
+                    for excluded_ir, start, end in excluded_segments
+                    if excluded_ir == relative_ir
+                }
+                selection_details = nonheuristic_augmentation_segments(
+                    passes, local_excluded, args.seed, relative_ir,
+                )
+                candidates = {
+                    pair: {"nonheuristic_augmentation"}
+                    for pair in selection_details
+                }
+                chosen = sorted(selection_details)
+            else:
+                selection_details = {}
+                candidates = {
+                    pair: selected_by
+                    for pair, selected_by in collect_candidates(passes, args.heuristics).items()
+                    if (relative_ir, pair[0], pair[1]) not in excluded_segments
+                }
+                chosen = sorted(select_candidates(
+                    candidates, args.max_segments_per_function, args.seed, relative_ir,
+                ))
             endpoint_indices = sorted({value for pair in chosen for value in pair})
             snapshot_data: dict[int, tuple[str, str]] = {}
             state_features: dict[int, dict[str, int | float]] = {}
@@ -649,6 +683,7 @@ def main() -> None:
                 "pass_count": len(passes),
                 "input_features": input_features,
                 "pass_sequence_sha256": pass_sequence_digest,
+                "selection_policy": effective_sampling_policy,
                 "selected_segment_count": len(chosen),
                 "passes": passes,
             }
@@ -670,7 +705,7 @@ def main() -> None:
                     "net_modified_count": net["modified_count"],
                     "net_diff": net["diff"],
                 })
-                segments.append({
+                segment = {
                     "schema_version": SCHEMA_VERSION,
                     "profile_method": PROFILE_METHOD,
                     "snapshot_method": SNAPSHOT_METHOD,
@@ -697,7 +732,11 @@ def main() -> None:
                     "boundary_features": flatten_boundary_features(
                         state_features[start], state_features[end],
                     ),
-                })
+                }
+                segment.update(selection_details.get((start, end), {
+                    "selection_policy": "heuristic",
+                }))
+                segments.append(segment)
         except Exception as error:
             errors.append({"relative_ir": relative_ir, "error": str(error)})
             continue
@@ -738,8 +777,21 @@ def main() -> None:
         "exclude_manifests": [str(path) for path in args.exclude_manifest],
         "exclude_manifest_sha256": [file_sha256(path) for path in args.exclude_manifest],
         "excluded_segment_count": len(excluded_segments),
-        "max_segments_per_function": args.max_segments_per_function,
-        "heuristics": list(args.heuristics),
+        "sampling_policy": effective_sampling_policy,
+        "max_segments_per_function": (
+            args.max_segments_per_function
+            if args.sampling_policy == "heuristic" else None
+        ),
+        "augmentation_segments_per_function": (
+            6 if args.sampling_policy == "nonheuristic_augmentation" else None
+        ),
+        "heuristics": (
+            list(args.heuristics) if args.sampling_policy == "heuristic" else []
+        ),
+        "excluded_heuristics": (
+            list(DESTIVA_CUTPOINT_HEURISTICS)
+            if args.sampling_policy == "nonheuristic_augmentation" else []
+        ),
         "seed": args.seed,
         "opt": str(args.opt),
         "opt_sha256": file_sha256(args.opt),
